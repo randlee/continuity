@@ -1,0 +1,76 @@
+#!/usr/bin/env python3
+"""continuity install — transparent gh/git interceptors.
+
+Usage:
+    python3 continuity-install         # install to ~/.local/bin
+    python3 continuity-install --undo  # remove
+"""
+
+import os
+import shutil
+import stat
+import sys
+from pathlib import Path
+
+BIN_DIR = Path.home() / ".local" / "bin"
+POC_DIR = Path(__file__).resolve().parent
+
+
+def resolve_binary(name: str) -> str:
+    wrapper_path = BIN_DIR / name
+    real = shutil.which(name)
+    if real and os.path.realpath(real) == str(wrapper_path):
+        paths = os.environ.get("PATH", "").split(":")
+        for p in paths:
+            if p == str(BIN_DIR):
+                continue
+            candidate = os.path.join(p, name)
+            if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+                return candidate
+    return real or f"/usr/bin/{name}"
+
+
+def install():
+    BIN_DIR.mkdir(parents=True, exist_ok=True)
+
+    real_gh = resolve_binary("gh")
+    real_git = resolve_binary("git")
+    print(f"real gh:  {real_gh}")
+    print(f"real git: {real_git}")
+
+    # gh wrapper — copy + patch binary paths
+    gh_code = (POC_DIR / "continuity-gh").read_text()
+    gh_code = gh_code.replace(
+        'REAL_GH = "/opt/homebrew/bin/gh"', f'REAL_GH = {real_gh!r}'
+    ).replace(
+        'REAL_GIT = "/usr/bin/git"', f'REAL_GIT = {real_git!r}'
+    )
+
+    gh_path = BIN_DIR / "gh"
+    gh_path.write_text(gh_code)
+    gh_path.chmod(gh_path.stat().st_mode | stat.S_IEXEC)
+    print(f"✔ {gh_path}")
+
+    # git wrapper — thin shim
+    git_path = BIN_DIR / "git"
+    git_path.write_text(f"""#!/bin/bash
+export CONTINUITY_COMMAND=git
+exec python3 {gh_path} "$@"
+""")
+    git_path.chmod(git_path.stat().st_mode | stat.S_IEXEC)
+    print(f"✔ {git_path}")
+
+    print()
+    print("export PATH=\"$HOME/.local/bin:$PATH\"")
+
+
+def uninstall():
+    for name in ("gh", "git"):
+        p = BIN_DIR / name
+        if p.exists():
+            p.unlink()
+            print(f"✘ {p}")
+
+
+if __name__ == "__main__":
+    uninstall() if "--undo" in sys.argv else install()

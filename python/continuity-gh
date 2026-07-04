@@ -1,0 +1,64 @@
+#!/usr/bin/env python3
+"""continuity-gh — transparent gh/git interceptor. Passes through everything,
+logs args + exit code + duration to SQLite. Zero observable difference.
+"""
+
+import json
+import os
+import sqlite3
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+REAL_GH = "/opt/homebrew/bin/gh"
+REAL_GIT = "/usr/bin/git"
+
+DB_DIR = Path.home() / ".local" / "share" / "continuity"
+DB_PATH = DB_DIR / "continuity.db"
+
+
+def ensure_db():
+    DB_DIR.mkdir(parents=True, exist_ok=True)
+    db = sqlite3.connect(str(DB_PATH))
+    db.execute("PRAGMA journal_mode=WAL")
+    db.execute("PRAGMA busy_timeout=2000")
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS cli_events (
+            id          INTEGER PRIMARY KEY,
+            command     TEXT    NOT NULL,
+            args_json   TEXT    NOT NULL,
+            exit_code   INTEGER,
+            duration_ms INTEGER,
+            recorded_at INTEGER NOT NULL
+        )
+    """)
+    db.commit()
+    return db
+
+
+def main():
+    command = os.environ.get("CONTINUITY_COMMAND", "gh")
+    real_binary = REAL_GH if command == "gh" else REAL_GIT
+    args = sys.argv[1:]
+
+    db = ensure_db()
+    start = time.time()
+
+    # Transparent delegation — no capture, no tee, no parsing
+    proc = subprocess.run([real_binary] + args, timeout=300)
+    duration_ms = int((time.time() - start) * 1000)
+
+    db.execute(
+        "INSERT INTO cli_events (command, args_json, exit_code, duration_ms, recorded_at) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (command, json.dumps(args), proc.returncode, duration_ms, int(time.time())),
+    )
+    db.commit()
+    db.close()
+
+    sys.exit(proc.returncode)
+
+
+if __name__ == "__main__":
+    main()
