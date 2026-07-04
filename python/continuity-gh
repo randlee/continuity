@@ -1,22 +1,62 @@
 #!/usr/bin/env python3
 """continuity-gh — transparent gh/git interceptor. Passes through everything,
 logs args + exit code + duration to SQLite. Zero observable difference.
+
+Cross-platform: macOS, Linux, Windows.
 """
 
 import json
 import os
+import shutil
 import sqlite3
 import subprocess
 import sys
 import time
 from pathlib import Path
 
-REAL_GH = "/opt/homebrew/bin/gh"
-REAL_GIT = "/usr/bin/git"
 
-DB_DIR = Path.home() / ".local" / "share" / "continuity"
-DB_PATH = DB_DIR / "continuity.db"
+# ── Binary resolution (cross-platform) ────────────────────────────────────
 
+def _resolve_binary(name: str) -> str:
+    """Resolve real gh/git binary, platform-aware."""
+    # On Windows, gh is 'gh.exe', git is 'git.exe'
+    if sys.platform == "win32":
+        name = f"{name}.exe"
+    resolved = shutil.which(name)
+    if resolved:
+        return resolved
+    # Fallbacks
+    if sys.platform == "win32":
+        base = os.environ.get("LOCALAPPDATA", os.path.expandvars(r"%USERPROFILE%\AppData\Local"))
+        return str(Path(base) / "Programs" / "Git" / "cmd" / f"{name}")
+    elif sys.platform == "darwin":
+        return f"/opt/homebrew/bin/{name}" if "gh" in name else f"/usr/bin/{name}"
+    else:  # linux
+        return f"/usr/bin/{name}"
+
+
+REAL_GH = _resolve_binary("gh")
+REAL_GIT = _resolve_binary("git")
+
+
+# ── Database path (cross-platform) ─────────────────────────────────────────
+
+def _data_dir() -> Path:
+    """Platform-appropriate data directory."""
+    if sys.platform == "win32":
+        base = os.environ.get("LOCALAPPDATA", os.path.expandvars(r"%USERPROFILE%\AppData\Local"))
+        return Path(base) / "continuity"
+    # XDG spec: $XDG_DATA_HOME or ~/.local/share
+    xdg = os.environ.get("XDG_DATA_HOME", "")
+    if xdg:
+        return Path(xdg) / "continuity"
+    return Path.home() / ".local" / "share" / "continuity"
+
+
+DB_PATH = _data_dir() / "continuity.db"
+
+
+# ── Schema ─────────────────────────────────────────────────────────────────
 
 def ensure_db(db_path: Path) -> sqlite3.Connection:
     db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -37,13 +77,34 @@ def ensure_db(db_path: Path) -> sqlite3.Connection:
     return db
 
 
+# ── Subprocess runner (cross-platform) ─────────────────────────────────────
+
+def _run_binary(binary: str, args: list[str], timeout: int = 300) -> subprocess.CompletedProcess:
+    """Run a binary or script, auto-detecting Python scripts."""
+    # If binary is a Python script (.py extension or starts with #!/...python),
+    # prepend sys.executable so it works on Windows (no shebang support)
+    is_python_script = False
+    try:
+        with open(binary, "r", encoding="utf-8") as f:
+            first_line = f.readline()
+        is_python_script = ("python" in first_line and first_line.startswith("#!")) or binary.endswith(".py")
+    except (OSError, UnicodeDecodeError):
+        pass
+
+    cmd = [sys.executable, binary] if is_python_script else [binary]
+    cmd.extend(args)
+    return subprocess.run(cmd, timeout=timeout)
+
+
+# ── Core interception ──────────────────────────────────────────────────────
+
 def intercept(command: str, args: list[str], real_binary: str,
               db_path: Path, timeout: int = 300) -> int:
     """Core interception logic. Returns exit code. Testable."""
     db = ensure_db(db_path)
     start = time.time()
 
-    proc = subprocess.run([real_binary] + args, timeout=timeout)
+    proc = _run_binary(real_binary, args, timeout=timeout)
     duration_ms = int((time.time() - start) * 1000)
 
     db.execute(
@@ -55,6 +116,8 @@ def intercept(command: str, args: list[str], real_binary: str,
     db.close()
     return proc.returncode
 
+
+# ── Entry point ────────────────────────────────────────────────────────────
 
 def main():
     command = os.environ.get("CONTINUITY_COMMAND", "gh")
