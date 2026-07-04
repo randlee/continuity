@@ -18,9 +18,9 @@ DB_DIR = Path.home() / ".local" / "share" / "continuity"
 DB_PATH = DB_DIR / "continuity.db"
 
 
-def ensure_db():
-    DB_DIR.mkdir(parents=True, exist_ok=True)
-    db = sqlite3.connect(str(DB_PATH))
+def ensure_db(db_path: Path) -> sqlite3.Connection:
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    db = sqlite3.connect(str(db_path))
     db.execute("PRAGMA journal_mode=WAL")
     db.execute("PRAGMA busy_timeout=2000")
     db.execute("""
@@ -37,16 +37,13 @@ def ensure_db():
     return db
 
 
-def main():
-    command = os.environ.get("CONTINUITY_COMMAND", "gh")
-    real_binary = REAL_GH if command == "gh" else REAL_GIT
-    args = sys.argv[1:]
-
-    db = ensure_db()
+def intercept(command: str, args: list[str], real_binary: str,
+              db_path: Path, timeout: int = 300) -> int:
+    """Core interception logic. Returns exit code. Testable."""
+    db = ensure_db(db_path)
     start = time.time()
 
-    # Transparent delegation — no capture, no tee, no parsing
-    proc = subprocess.run([real_binary] + args, timeout=300)
+    proc = subprocess.run([real_binary] + args, timeout=timeout)
     duration_ms = int((time.time() - start) * 1000)
 
     db.execute(
@@ -56,8 +53,15 @@ def main():
     )
     db.commit()
     db.close()
+    return proc.returncode
 
-    sys.exit(proc.returncode)
+
+def main():
+    command = os.environ.get("CONTINUITY_COMMAND", "gh")
+    real_binary = REAL_GH if command == "gh" else REAL_GIT
+    args = sys.argv[1:]
+    exit_code = intercept(command, args, real_binary, DB_PATH)
+    sys.exit(exit_code)
 
 
 if __name__ == "__main__":

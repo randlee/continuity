@@ -1,0 +1,40 @@
+#!/usr/bin/env python3
+"""Fake binary for testing continuity-gh. Echoes args and returns configurable exit code.
+
+Usage:
+    fake-gh --exit 0 -- arg1 arg2     # returns 0, prints args
+    fake-gh --exit 1 --sleep 0.1 --   # returns 1, sleeps 100ms
+    fake-gh --exit 0                  # returns 0, no output
+"""
+
+import sys
+import time
+
+if __name__ == "__main__":
+    exit_code = 0
+    sleep_sec = 0
+    args_start = 1
+
+    while args_start < len(sys.argv) and sys.argv[args_start].startswith("--"):
+        if sys.argv[args_start] == "--exit" and args_start + 1 < len(sys.argv):
+            exit_code = int(sys.argv[args_start + 1])
+            args_start += 2
+        elif sys.argv[args_start] == "--sleep" and args_start + 1 < len(sys.argv):
+            sleep_sec = float(sys.argv[args_start + 1])
+            args_start += 2
+        elif sys.argv[args_start] == "--":
+            args_start += 1
+            break
+        else:
+            args_start += 1
+
+    if sleep_sec:
+        time.sleep(sleep_sec)
+
+    # Echo remaining args
+    for a in sys.argv[args_start:]:
+        print(a, end=" ")
+    if args_start < len(sys.argv):
+        print()
+
+    sys.exit(exit_code)
