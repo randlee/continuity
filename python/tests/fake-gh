@@ -1,40 +1,101 @@
 #!/usr/bin/env python3
-"""Fake binary for testing continuity-gh. Echoes args and returns configurable exit code.
+"""Fake binary for testing continuity-gh.
+
+Handles gh and git subcommands for realistic test scenarios.
+Flags (--exit, --stdout, --file, --sleep) can appear anywhere in args.
 
 Usage:
-    fake-gh --exit 0 -- arg1 arg2     # returns 0, prints args
-    fake-gh --exit 1 --sleep 0.1 --   # returns 1, sleeps 100ms
-    fake-gh --exit 0                  # returns 0, no output
+    fake-gh --exit 0 pr list
+    fake-gh pr view 42 --exit 0 --stdout '{"number":42}'
+    fake-gh repo view --json nameWithOwner -q .nameWithOwner
 """
 
+import json
+import os
 import sys
 import time
+from pathlib import Path
 
-if __name__ == "__main__":
+TEST_REPO = os.environ.get("CONTINUITY_TEST_REPO", "test-owner/test-repo")
+
+
+def scan_flags(argv: list[str]) -> tuple[int, float, str | None, list[str]]:
+    """Scan all args for --exit, --sleep, --stdout, --file. Returns
+    (exit_code, sleep_sec, stdout_text, remaining_args)."""
     exit_code = 0
-    sleep_sec = 0
-    args_start = 1
-
-    while args_start < len(sys.argv) and sys.argv[args_start].startswith("--"):
-        if sys.argv[args_start] == "--exit" and args_start + 1 < len(sys.argv):
-            exit_code = int(sys.argv[args_start + 1])
-            args_start += 2
-        elif sys.argv[args_start] == "--sleep" and args_start + 1 < len(sys.argv):
-            sleep_sec = float(sys.argv[args_start + 1])
-            args_start += 2
-        elif sys.argv[args_start] == "--":
-            args_start += 1
+    sleep_sec = 0.0
+    stdout_text = None
+    remaining = []
+    i = 1
+    while i < len(argv):
+        a = argv[i]
+        if a == "--exit" and i + 1 < len(argv):
+            exit_code = int(argv[i + 1])
+            i += 2
+        elif a == "--sleep" and i + 1 < len(argv):
+            sleep_sec = float(argv[i + 1])
+            i += 2
+        elif a == "--stdout" and i + 1 < len(argv):
+            stdout_text = argv[i + 1]
+            i += 2
+        elif a == "--file" and i + 1 < len(argv):
+            filepath = argv[i + 1]
+            if not filepath.startswith("/"):
+                fixtures = Path(__file__).resolve().parent / "fixtures"
+                filepath = str(fixtures / filepath)
+            stdout_text = Path(filepath).read_text()
+            i += 2
+        elif a == "--":
+            # Everything after -- is remaining args, stop processing flags
+            remaining.extend(argv[i + 1:])
             break
         else:
-            args_start += 1
+            remaining.append(a)
+            i += 1
+    return exit_code, sleep_sec, stdout_text, remaining
+
+
+def handle_gh(args: list[str]) -> tuple[int, str] | None:
+    """Handle specific gh subcommands for realistic test responses."""
+    if not args:
+        return None
+
+    # gh repo view --json nameWithOwner -q .nameWithOwner
+    if args[0] == "repo" and len(args) >= 2 and args[1] == "view":
+        for a in args:
+            if "nameWithOwner" in a:
+                return 0, TEST_REPO + "\n"
+        return 0, json.dumps({"nameWithOwner": TEST_REPO})
+
+    # gh pr create — echo URL
+    if args[0] == "pr" and len(args) >= 2 and args[1] == "create":
+        return 0, f"https://github.com/{TEST_REPO}/pull/42\n"
+
+    return None
+
+
+def main():
+    exit_code, sleep_sec, stdout_text, remaining = scan_flags(sys.argv)
 
     if sleep_sec:
         time.sleep(sleep_sec)
 
-    # Echo remaining args
-    for a in sys.argv[args_start:]:
-        print(a, end=" ")
-    if args_start < len(sys.argv):
+    # Try subcommand handler first
+    if stdout_text is None and remaining:
+        result = handle_gh(remaining)
+        if result is not None:
+            exit_code = result[0]
+            stdout_text = result[1]
+
+    if stdout_text is not None:
+        sys.stdout.write(stdout_text)
+    elif remaining:
+        for a in remaining:
+            print(a, end=" ")
         print()
 
     sys.exit(exit_code)
+
+
+if __name__ == "__main__":
+    main()

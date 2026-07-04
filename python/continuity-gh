@@ -1,12 +1,17 @@
 #!/usr/bin/env python3
-"""continuity-gh — transparent gh/git interceptor. Passes through everything,
-logs args + exit code + duration to SQLite. Zero observable difference.
+"""continuity-gh — transparent gh/git interceptor with structured CI parsing.
+
+Phase 1: transparent pass-through + raw logging (done)
+Phase 2: structured parsing — identifies subcommands, extracts CI state
+         into ci_events/pull_requests/repos tables. Parsing is post-hoc:
+         never affects exit code, stdout, or stderr.
 
 Cross-platform: macOS, Linux, Windows.
 """
 
 import json
 import os
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -19,19 +24,17 @@ from pathlib import Path
 
 def _resolve_binary(name: str) -> str:
     """Resolve real gh/git binary, platform-aware."""
-    # On Windows, gh is 'gh.exe', git is 'git.exe'
     if sys.platform == "win32":
         name = f"{name}.exe"
     resolved = shutil.which(name)
     if resolved:
         return resolved
-    # Fallbacks
     if sys.platform == "win32":
         base = os.environ.get("LOCALAPPDATA", os.path.expandvars(r"%USERPROFILE%\AppData\Local"))
         return str(Path(base) / "Programs" / "Git" / "cmd" / f"{name}")
     elif sys.platform == "darwin":
         return f"/opt/homebrew/bin/{name}" if "gh" in name else f"/usr/bin/{name}"
-    else:  # linux
+    else:
         return f"/usr/bin/{name}"
 
 
@@ -46,7 +49,6 @@ def _data_dir() -> Path:
     if sys.platform == "win32":
         base = os.environ.get("LOCALAPPDATA", os.path.expandvars(r"%USERPROFILE%\AppData\Local"))
         return Path(base) / "continuity"
-    # XDG spec: $XDG_DATA_HOME or ~/.local/share
     xdg = os.environ.get("XDG_DATA_HOME", "")
     if xdg:
         return Path(xdg) / "continuity"
@@ -56,23 +58,63 @@ def _data_dir() -> Path:
 DB_PATH = _data_dir() / "continuity.db"
 
 
-# ── Schema ─────────────────────────────────────────────────────────────────
+# ── Schema (Phase 1 + Phase 2 tables) ──────────────────────────────────────
+
+SCHEMA = """
+    -- Phase 1: raw audit log
+    CREATE TABLE IF NOT EXISTS cli_events (
+        id          INTEGER PRIMARY KEY,
+        command     TEXT    NOT NULL,
+        args_json   TEXT    NOT NULL,
+        exit_code   INTEGER,
+        duration_ms INTEGER,
+        recorded_at INTEGER NOT NULL
+    );
+
+    -- Phase 2: tracked repos (matches design doc)
+    CREATE TABLE IF NOT EXISTS repos (
+        id              INTEGER PRIMARY KEY,
+        owner_repo      TEXT    UNIQUE NOT NULL,
+        gh_account      TEXT    NOT NULL,
+        last_synced     INTEGER,
+        avg_ci_duration INTEGER,
+        max_ci_duration INTEGER
+    );
+
+    -- Phase 2: PR state (matches design doc)
+    CREATE TABLE IF NOT EXISTS pull_requests (
+        id          INTEGER PRIMARY KEY,
+        owner_repo  TEXT    NOT NULL,
+        pr_number   INTEGER NOT NULL,
+        branch      TEXT    NOT NULL,
+        head_sha    TEXT,
+        mergeable   TEXT,
+        state       TEXT,
+        updated_at  INTEGER,
+        UNIQUE(owner_repo, pr_number)
+    );
+
+    -- Phase 2: immutable CI event log (matches design doc)
+    CREATE TABLE IF NOT EXISTS ci_events (
+        id          INTEGER PRIMARY KEY,
+        owner_repo  TEXT    NOT NULL,
+        pr_number   INTEGER NOT NULL,
+        job_name    TEXT    NOT NULL,
+        status      TEXT    NOT NULL,
+        conclusion  TEXT,
+        recorded_at INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_ci_lookup
+        ON ci_events(owner_repo, pr_number, job_name, recorded_at DESC);
+"""
+
 
 def ensure_db(db_path: Path) -> sqlite3.Connection:
     db_path.parent.mkdir(parents=True, exist_ok=True)
     db = sqlite3.connect(str(db_path))
     db.execute("PRAGMA journal_mode=WAL")
     db.execute("PRAGMA busy_timeout=2000")
-    db.execute("""
-        CREATE TABLE IF NOT EXISTS cli_events (
-            id          INTEGER PRIMARY KEY,
-            command     TEXT    NOT NULL,
-            args_json   TEXT    NOT NULL,
-            exit_code   INTEGER,
-            duration_ms INTEGER,
-            recorded_at INTEGER NOT NULL
-        )
-    """)
+    db.executescript(SCHEMA)
     db.commit()
     return db
 
@@ -81,8 +123,6 @@ def ensure_db(db_path: Path) -> sqlite3.Connection:
 
 def _run_binary(binary: str, args: list[str], timeout: int = 300) -> subprocess.CompletedProcess:
     """Run a binary or script, auto-detecting Python scripts."""
-    # If binary is a Python script (.py extension or starts with #!/...python),
-    # prepend sys.executable so it works on Windows (no shebang support)
     is_python_script = False
     try:
         with open(binary, "r", encoding="utf-8") as f:
@@ -93,27 +133,249 @@ def _run_binary(binary: str, args: list[str], timeout: int = 300) -> subprocess.
 
     cmd = [sys.executable, binary] if is_python_script else [binary]
     cmd.extend(args)
-    return subprocess.run(cmd, timeout=timeout)
+    return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+
+
+# ── Structured parsing (Phase 2) ───────────────────────────────────────────
+
+STATUS_MAP = {
+    "QUEUED": "QUEUED", "IN_PROGRESS": "IN_PROGRESS",
+    "COMPLETED": "COMPLETED", "PENDING": "QUEUED",
+    "REQUESTED": "QUEUED", "WAITING": "QUEUED",
+}
+
+
+def _detect_repo(real_gh: str) -> str:
+    """Detect current repo as owner/repo via gh CLI."""
+    try:
+        proc = subprocess.run(
+            [real_gh, "repo", "view", "--json", "nameWithOwner",
+             "-q", ".nameWithOwner"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if proc.returncode == 0:
+            return proc.stdout.strip()
+    except Exception:
+        pass
+    return ""
+
+
+def _ensure_repo(db: sqlite3.Connection, owner_repo: str):
+    """Auto-register repo if not already tracked."""
+    if not owner_repo:
+        return
+    existing = db.execute("SELECT 1 FROM repos WHERE owner_repo = ?", (owner_repo,)).fetchone()
+    if existing:
+        return
+    owner = owner_repo.split("/")[0] if "/" in owner_repo else owner_repo
+    db.execute("INSERT INTO repos (owner_repo, gh_account) VALUES (?, ?)", (owner_repo, owner))
+
+
+def _parse_checks_json(db: sqlite3.Connection, repo: str, pr_num: int, data):
+    """Parse statusCheckRollup JSON into ci_events with state diffing."""
+    checks = []
+    if isinstance(data, dict):
+        rollup = data.get("statusCheckRollup", [])
+        if isinstance(rollup, list):
+            checks = rollup
+    elif isinstance(data, list):
+        checks = data
+
+    now = int(time.time())
+    for check in checks:
+        if not isinstance(check, dict):
+            continue
+        name = check.get("name", "unknown")
+        status = STATUS_MAP.get(check.get("status", "UNKNOWN").upper(),
+                                check.get("status", "UNKNOWN").upper())
+        conclusion = check.get("conclusion")
+        if conclusion:
+            conclusion = conclusion.upper()
+
+        # State diffing: only insert if status/conclusion changed
+        last = db.execute(
+            "SELECT status, conclusion FROM ci_events "
+            "WHERE owner_repo = ? AND pr_number = ? AND job_name = ? "
+            "ORDER BY recorded_at DESC LIMIT 1",
+            (repo, pr_num, name),
+        ).fetchone()
+
+        changed = (last is None or last[0] != status or last[1] != conclusion)
+        if changed:
+            db.execute(
+                "INSERT INTO ci_events (owner_repo, pr_number, job_name, status, conclusion, recorded_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (repo, pr_num, name, status, conclusion, now),
+            )
+
+
+def parse_command(command: str, args: list[str], stdout: str,
+                  stderr: str, exit_code: int, real_binary: str,
+                  db: sqlite3.Connection) -> None:
+    """Parse structured CI data from command output. Never raises. Never
+    affects exit code. Called after delegation completes successfully."""
+
+    if exit_code != 0:
+        return
+    if not args:
+        return
+
+    try:
+        if command == "gh":
+            _parse_gh(args, stdout, real_binary, db)
+        elif command == "git" and args[0] == "push":
+            _parse_git_push(args, db)
+    except Exception:
+        pass  # parse failures are silent — never affect the caller
+
+
+def _parse_gh(args: list[str], stdout: str, real_gh: str, db: sqlite3.Connection):
+    cmd = args[0]
+    sub = args[1] if len(args) > 1 else ""
+    repo = ""  # lazy, detected on first need
+
+    def _repo():
+        nonlocal repo
+        if not repo:
+            repo = _detect_repo(real_gh)
+        return repo
+
+    # ── gh pr create ──────────────────────────────────────────────────
+    if cmd == "pr" and sub == "create":
+        m = re.search(r"github\.com/([\w.-]+/[\w.-]+)/pull/(\d+)", stdout)
+        if m:
+            owner_repo, pr_num = m.group(1), int(m.group(2))
+            _ensure_repo(db, owner_repo)
+            branch = ""
+            for i, a in enumerate(args):
+                if a in ("--head", "-H") and i + 1 < len(args):
+                    branch = args[i + 1]
+                    break
+            now = int(time.time())
+            db.execute(
+                "INSERT OR REPLACE INTO pull_requests (owner_repo, pr_number, branch, state, updated_at) "
+                "VALUES (?, ?, ?, 'OPEN', ?)",
+                (owner_repo, pr_num, branch or "unknown", now),
+            )
+
+    # ── gh pr merge ───────────────────────────────────────────────────
+    elif cmd == "pr" and sub == "merge":
+        for a in args[2:]:
+            try:
+                pr_num = int(a)
+                # Look up repo from existing PR, fall back to detection
+                row = db.execute(
+                    "SELECT owner_repo FROM pull_requests WHERE pr_number = ? LIMIT 1",
+                    (pr_num,),
+                ).fetchone()
+                r = row[0] if row else _repo()
+                if r:
+                    db.execute(
+                        "UPDATE pull_requests SET state='MERGED', updated_at=? "
+                        "WHERE owner_repo=? AND pr_number=?",
+                        (int(time.time()), r, pr_num),
+                    )
+                break
+            except ValueError:
+                continue
+
+    # ── gh pr view --json ─────────────────────────────────────────────
+    elif cmd == "pr" and sub == "view" and "--json" in args:
+        try:
+            data = json.loads(stdout)
+        except json.JSONDecodeError:
+            return
+        if not isinstance(data, dict):
+            return
+
+        pr_num = data.get("number")
+        r = _repo()
+        if not r or not pr_num:
+            return
+
+        now = int(time.time())
+        db.execute(
+            "INSERT OR REPLACE INTO pull_requests "
+            "(owner_repo, pr_number, branch, head_sha, mergeable, state, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (r, pr_num,
+             data.get("headRefName", "unknown"),
+             data.get("headRefOid"),
+             data.get("mergeable", "UNKNOWN").upper(),
+             (data.get("state") or "OPEN").upper(),
+             now),
+        )
+        if "statusCheckRollup" in data:
+            _parse_checks_json(db, r, pr_num, data["statusCheckRollup"])
+
+    # ── gh pr checks ──────────────────────────────────────────────────
+    elif cmd == "pr" and sub in ("checks", "status"):
+        pr_num = None
+        for a in args[2:]:
+            try:
+                pr_num = int(a)
+                break
+            except ValueError:
+                continue
+        if pr_num:
+            try:
+                data = json.loads(stdout)
+            except json.JSONDecodeError:
+                return
+            r = _repo()
+            if r:
+                _parse_checks_json(db, r, pr_num, data)
+
+
+def _parse_git_push(args: list[str], db: sqlite3.Connection):
+    """Record git push events."""
+    now = int(time.time())
+    remote = "origin"
+    ref = ""
+    for i, a in enumerate(args[1:], 1):
+        if not a.startswith("-"):
+            if i == 1:
+                remote = a
+            elif i == 2:
+                ref = a
+            break
+    db.execute(
+        "INSERT INTO cli_events (command, args_json, exit_code, duration_ms, recorded_at) "
+        "VALUES ('git-push', ?, 0, 0, ?)",
+        (json.dumps({"remote": remote, "ref": ref or "push"}), now),
+    )
 
 
 # ── Core interception ──────────────────────────────────────────────────────
 
 def intercept(command: str, args: list[str], real_binary: str,
               db_path: Path, timeout: int = 300) -> int:
-    """Core interception logic. Returns exit code. Testable."""
+    """Core interception logic. Returns exit code. Parses structured data
+    post-hoc — parse failures never affect exit code or output."""
     db = ensure_db(db_path)
     start = time.time()
 
     proc = _run_binary(real_binary, args, timeout=timeout)
     duration_ms = int((time.time() - start) * 1000)
+    now = int(time.time())
 
+    # Phase 1: raw audit log
     db.execute(
         "INSERT INTO cli_events (command, args_json, exit_code, duration_ms, recorded_at) "
         "VALUES (?, ?, ?, ?, ?)",
-        (command, json.dumps(args), proc.returncode, duration_ms, int(time.time())),
+        (command, json.dumps(args), proc.returncode, duration_ms, now),
     )
+
+    # Phase 2: structured parsing (runs after logging, never affects exit code)
+    parse_command(command, args, proc.stdout, proc.stderr,
+                  proc.returncode, real_binary, db)
+
     db.commit()
     db.close()
+
+    # Write captured output to real stdout/stderr (transparent)
+    sys.stdout.write(proc.stdout)
+    sys.stderr.write(proc.stderr)
     return proc.returncode
 
 

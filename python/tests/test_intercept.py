@@ -204,11 +204,11 @@ class TestCrossPlatform:
     def test_run_binary_python_script_uses_sys_executable(self, fake_gh, monkeypatch):
         """Verify Python scripts are invoked with sys.executable."""
         captured_cmd = []
-        real_run = subprocess.run  # save before monkeypatching
+        real_run = subprocess.run
 
-        def fake_run(cmd, timeout=None):
+        def fake_run(cmd, **kwargs):
             captured_cmd.append(list(cmd))
-            return real_run(cmd, timeout=timeout)
+            return real_run(cmd, **kwargs)
 
         monkeypatch.setattr(subprocess, "run", fake_run)
         cg._run_binary(fake_gh, ["--exit", "0", "--"], timeout=10)
@@ -330,6 +330,6 @@ class TestAdrRequirements:
             elif isinstance(node, ast.ImportFrom):
                 if node.module:
                     imports.add(node.module.split(".")[0])
-        stdlib = {"json", "os", "shutil", "sqlite3", "subprocess", "sys", "time", "pathlib"}
+        stdlib = {"json", "os", "re", "shutil", "sqlite3", "subprocess", "sys", "time", "pathlib"}
         for imp in imports:
             assert imp in stdlib, f"non-stdlib import: {imp}"
