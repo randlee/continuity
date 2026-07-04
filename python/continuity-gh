@@ -61,13 +61,14 @@ DB_PATH = _data_dir() / "continuity.db"
 # ── Schema (Phase 1 + Phase 2 tables) ──────────────────────────────────────
 
 SCHEMA = """
-    -- Phase 1: raw audit log
+    -- Phase 1: raw audit log (Phase 3 adds blocked column)
     CREATE TABLE IF NOT EXISTS cli_events (
         id          INTEGER PRIMARY KEY,
         command     TEXT    NOT NULL,
         args_json   TEXT    NOT NULL,
         exit_code   INTEGER,
         duration_ms INTEGER,
+        blocked     INTEGER DEFAULT 0,
         recorded_at INTEGER NOT NULL
     );
 
@@ -136,7 +137,99 @@ def _run_binary(binary: str, args: list[str], timeout: int = 300) -> subprocess.
     return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
 
 
-# ── Structured parsing (Phase 2) ───────────────────────────────────────────
+# ── Dangerous command blocking (Phase 3) ────────────────────────────────────
+
+# Patterns: (command, subcommand, ...) -> block message
+DANGEROUS = {
+    ("gh", "pr", "merge"): (
+        "continuity: pr merge blocked. Use --auto flag or review via web UI.\n"
+        "Override: CONTINUITY_ALLOW_DANGEROUS=1 gh pr merge ...\n"
+    ),
+    ("gh", "repo", "delete"): (
+        "continuity: repo delete blocked. Use GitHub web UI to delete repos.\n"
+        "Override: CONTINUITY_ALLOW_DANGEROUS=1 gh repo delete ...\n"
+    ),
+    ("gh", "api"): (
+        "continuity: destructive gh api call blocked.\n"
+        "Override: CONTINUITY_ALLOW_DANGEROUS=1 gh api ...\n"
+    ),
+    ("git", "push", "--force"): (
+        "continuity: force push blocked. Use --force-with-lease instead.\n"
+        "Override: CONTINUITY_ALLOW_DANGEROUS=1 git push --force ...\n"
+    ),
+    ("git", "push", "-f"): (
+        "continuity: force push blocked. Use --force-with-lease instead.\n"
+        "Override: CONTINUITY_ALLOW_DANGEROUS=1 git push -f ...\n"
+    ),
+    ("git", "branch", "-D"): (
+        "continuity: force delete branch blocked.\n"
+        "Override: CONTINUITY_ALLOW_DANGEROUS=1 git branch -D ...\n"
+    ),
+    ("git", "push", "--delete"): (
+        "continuity: delete remote branch blocked.\n"
+        "Override: CONTINUITY_ALLOW_DANGEROUS=1 git push --delete ...\n"
+    ),
+}
+
+
+def _check_api_method(args: list[str]) -> str | None:
+    """Check if gh api call uses a destructive HTTP method."""
+    for i, a in enumerate(args):
+        if a in ("--method", "-X") and i + 1 < len(args):
+            if args[i + 1].upper() in ("DELETE", "PATCH", "PUT"):
+                return DANGEROUS[("gh", "api")]
+    return None
+
+
+def check_dangerous(command: str, args: list[str]) -> str | None:
+    """Return block message if command is dangerous, None if safe.
+    Respects CONTINUITY_ALLOW_DANGEROUS=1 override."""
+    if os.environ.get("CONTINUITY_ALLOW_DANGEROUS") == "1":
+        return None
+
+    if not args:
+        return None
+
+    # Gh commands: check (gh, subcommand, ...) patterns
+    if command == "gh":
+        for depth in range(1, min(len(args) + 1, 4)):
+            pattern = (command,) + tuple(args[:depth])
+            if pattern in DANGEROUS:
+                # gh pr merge --auto is safe
+                if pattern == ("gh", "pr", "merge") and "--auto" in args:
+                    return None
+                # gh api — only block if a destructive method is detected
+                if pattern == ("gh", "api"):
+                    return _check_api_method(args)
+                return DANGEROUS[pattern]
+
+        # gh api with method flag anywhere (catch --method later in args)
+        if args[0] == "api":
+            return _check_api_method(args)
+        return None
+
+    # Git commands: match exact pattern sequences for fixed-order patterns,
+    # then scan for flags that can appear anywhere in push args.
+    if command == "git":
+        for pattern, msg in DANGEROUS.items():
+            if pattern[0] != "git":
+                continue
+            pat_args = list(pattern[1:])
+            if len(args) >= len(pat_args):
+                if all(args[i] == pat_args[i] for i in range(len(pat_args))):
+                    return msg
+
+        # git push with --force / -f anywhere in args (catch: git push origin main -f)
+        if args[0] == "push" and "--force-with-lease" not in args:
+            for a in args:
+                if a in ("--force", "-f"):
+                    return DANGEROUS[("git", "push", "--force")]
+
+        # git push --delete anywhere in args (catch: git push origin --delete branch)
+        if args[0] == "push" and "--delete" in args:
+            return DANGEROUS[("git", "push", "--delete")]
+
+    return None
 
 STATUS_MAP = {
     "QUEUED": "QUEUED", "IN_PROGRESS": "IN_PROGRESS",
@@ -350,20 +443,34 @@ def _parse_git_push(args: list[str], db: sqlite3.Connection):
 
 def intercept(command: str, args: list[str], real_binary: str,
               db_path: Path, timeout: int = 300) -> int:
-    """Core interception logic. Returns exit code. Parses structured data
-    post-hoc — parse failures never affect exit code or output."""
+    """Core interception logic. Checks dangerous commands before delegation
+    (Phase 3). Parses structured data post-hoc (Phase 2). Never affects
+    exit code or output for safe commands."""
     db = ensure_db(db_path)
-    start = time.time()
+    now = int(time.time())
 
+    # Phase 3: dangerous command check — blocks BEFORE delegation
+    block_msg = check_dangerous(command, args)
+    if block_msg:
+        db.execute(
+            "INSERT INTO cli_events (command, args_json, exit_code, duration_ms, blocked, recorded_at) "
+            "VALUES (?, ?, -1, 0, 1, ?)",
+            (command, json.dumps(args), now),
+        )
+        db.commit()
+        db.close()
+        sys.stderr.write(block_msg)
+        return 1
+
+    start = time.time()
     proc = _run_binary(real_binary, args, timeout=timeout)
     duration_ms = int((time.time() - start) * 1000)
-    now = int(time.time())
 
     # Phase 1: raw audit log
     db.execute(
         "INSERT INTO cli_events (command, args_json, exit_code, duration_ms, recorded_at) "
         "VALUES (?, ?, ?, ?, ?)",
-        (command, json.dumps(args), proc.returncode, duration_ms, now),
+        (command, json.dumps(args), proc.returncode, duration_ms, int(time.time())),
     )
 
     # Phase 2: structured parsing (runs after logging, never affects exit code)

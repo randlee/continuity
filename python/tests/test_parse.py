@@ -88,7 +88,8 @@ class TestParsePrCreate:
 class TestParsePrMerge:
     """FR-10: gh pr merge → mark PR as MERGED."""
 
-    def test_marks_pr_merged(self, fake_gh, db_path):
+    def test_marks_pr_merged(self, fake_gh, db_path, monkeypatch):
+        monkeypatch.setenv("CONTINUITY_ALLOW_DANGEROUS", "1")
         # First create the PR via parsing
         stdout = "https://github.com/randlee/continuity/pull/42\n"
         cg.intercept("gh", ["pr", "create", "--head", "feat/x",
@@ -258,10 +259,11 @@ class TestParseSafety:
                                  fake_gh, db_path)
         assert exit_code == 3  # real binary's exit code preserved
 
-    def test_parse_exception_does_not_affect_exit(self, fake_gh, db_path):
+    def test_parse_exception_does_not_affect_exit(self, fake_gh, db_path, monkeypatch):
         """Any exception in parser is caught — NF-07."""
+        monkeypatch.setenv("CONTINUITY_ALLOW_DANGEROUS", "1")
         for args in [
-            ["pr", "merge"],  # no PR number
+            ["pr", "merge"],  # no PR number (override needed — blocked by Phase 3)
             ["pr", "view", "--json", "..."],  # no PR number
             ["unknown", "command"],
         ]:
@@ -325,8 +327,9 @@ class TestAdrPhase2:
         pr = db.execute("SELECT owner_repo, pr_number, branch FROM pull_requests").fetchone()
         assert pr == ("randlee/atm-core", 99, "fix/bug")
 
-    def test_FR10_pr_merge_parsing(self, fake_gh, db_path):
+    def test_FR10_pr_merge_parsing(self, fake_gh, db_path, monkeypatch):
         """FR-10: gh pr merge parsed → mark PR as MERGED."""
+        monkeypatch.setenv("CONTINUITY_ALLOW_DANGEROUS", "1")
         stdout = "https://github.com/randlee/x/pull/1\n"
         cg.intercept("gh", ["pr", "create", "--stdout", stdout, "--exit", "0", "--"],
                      fake_gh, db_path)
