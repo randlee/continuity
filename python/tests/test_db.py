@@ -34,7 +34,8 @@ class TestSchema:
     def test_idempotent(self, conn):
         # ensure_db already called by fixture; calling again is idempotent
         db_path = Path(conn.execute("PRAGMA database_list").fetchone()[2])
-        db.ensure_db(db_path)  # no error
+        conn2 = db.ensure_db(db_path)  # second connection
+        conn2.close()  # close it so Windows can clean up
 
     def test_creates_parent_dir(self):
         with tempfile.TemporaryDirectory() as td:
