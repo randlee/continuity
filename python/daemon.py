@@ -24,6 +24,18 @@ from pathlib import Path
 
 from diff import diff_jobs, diff_prs, diff_conflicts, CiEvent
 from gh.client import GhClient
+from notify import (
+    PrCreatedUnmergable, PrBecameUnmergable, CascadeUnmergable,
+    CiCompleted, CiSlow, CiTimeout, NotificationEvent,
+    dispatch_notifications, resolve_pr_identity, resolve_push_identity,
+)
+from constants import (
+    STATUS_COMPLETED, STATUS_QUEUED, STATUS_IN_PROGRESS,
+    MERGEABLE_CONFLICTING,
+    PR_STATE_OPEN, PR_STATE_MERGED, PR_STATE_CLOSED,
+    CONCLUSION_SUCCESS, CONCLUSION_FAILURE,
+    TERMINAL_STATUSES, ACTIVE_STATUSES,
+)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -163,8 +175,9 @@ class Daemon:
     # ── Poll cycle ───────────────────────────────────────────────────────
 
     def _poll_cycle(self):
-        """Query all accounts, diff results, write to DB."""
+        """Query all accounts, diff results, write to DB, dispatch notifications."""
         now = int(time.time())
+        notify_events: list[NotificationEvent] = []
 
         for account, client in self.clients.items():
             repos = self._get_repos(account)
@@ -176,9 +189,14 @@ class Daemon:
             except Exception:
                 continue  # transient failure — retry next cycle
 
-            self._apply_result(result, now)
+            events = self._apply_result(result, now)
+            notify_events.extend(events)
 
         self.db.commit()
+
+        # Dispatch notifications in a spawned thread (non-blocking)
+        if notify_events:
+            dispatch_notifications(self.db, notify_events)
 
     def _get_repos(self, account: str) -> list[str]:
         """Get tracked repos for an account."""
@@ -187,9 +205,10 @@ class Daemon:
         ).fetchall()
         return [r[0] for r in rows]
 
-    def _apply_result(self, result, now: int):
-        """Diff poll result against DB, write events."""
+    def _apply_result(self, result, now: int) -> list[NotificationEvent]:
+        """Diff poll result against DB, write events, return notification events."""
         from gh.client import ApiUsage
+        notify_events: list[NotificationEvent] = []
 
         # Update API usage
         rl = result.rate_limit
@@ -204,6 +223,9 @@ class Daemon:
             current_jobs = self._load_current_jobs(owner_repo)
             current_prs = self._load_current_prs(owner_repo)
 
+            # Track merged PRs for cascade detection
+            merged_prs: list[int] = []
+
             # Diff jobs
             incoming_jobs = [(owner_repo, pr.number, pr.checks) for pr in prs]
             events = diff_jobs(incoming_jobs, current_jobs)
@@ -214,6 +236,11 @@ class Daemon:
                     (e.owner_repo, e.pr_number, e.job_name, e.status, e.conclusion, now),
                 )
 
+                # Detect CI completion
+                if e.status == STATUS_COMPLETED:
+                    _add_ci_completion(notify_events, owner_repo, e.pr_number,
+                                       self.db, current_jobs)
+
             # Diff PRs
             pr_diff = diff_prs(prs, current_prs)
             for pr in pr_diff.added:
@@ -222,12 +249,38 @@ class Daemon:
                     "VALUES (?, ?, ?, ?, ?)",
                     (owner_repo, pr.number, "", pr.state, now),
                 )
+                # New PR: check if unmergable
+                if pr.mergeable == MERGEABLE_CONFLICTING:
+                    identity = resolve_pr_identity(self.db, owner_repo, pr.number)
+                    if identity is None:
+                        identity = resolve_push_identity(self.db, owner_repo)
+                    notify_events.append(PrCreatedUnmergable(
+                        owner_repo, pr.number, identity, [],
+                    ))
+
             for pr in pr_diff.updated:
                 self.db.execute(
                     "UPDATE pull_requests SET state=?, mergeable=?, updated_at=? "
                     "WHERE owner_repo=? AND pr_number=?",
                     (pr.state, pr.mergeable or "UNKNOWN", now, owner_repo, pr.number),
                 )
+
+                # Detect PR merged (for cascade later)
+                prev = current_prs.get(pr.number)
+                if pr.state in (PR_STATE_MERGED, PR_STATE_CLOSED) and prev and prev.state == PR_STATE_OPEN:
+                    merged_prs.append(pr.number)
+
+                # Detect PR became unmergable after a push
+                if (prev and prev.mergeable != MERGEABLE_CONFLICTING
+                        and pr.mergeable == MERGEABLE_CONFLICTING
+                        and prev.state == PR_STATE_OPEN):
+                    identity = resolve_push_identity(self.db, owner_repo)
+                    if identity is None:
+                        identity = resolve_pr_identity(self.db, owner_repo, pr.number)
+                    notify_events.append(PrBecameUnmergable(
+                        owner_repo, pr.number, identity,
+                    ))
+
             for pr in pr_diff.closed:
                 self.db.execute(
                     "UPDATE pull_requests SET state='CLOSED', updated_at=? "
@@ -235,7 +288,7 @@ class Daemon:
                     (now, owner_repo, pr.number),
                 )
 
-            # Conflict detection (FR-37)
+            # Conflict detection (FR-37): new conflicts
             conflicts = diff_conflicts(owner_repo, prs, current_prs)
             for repo_name, pr_num in conflicts:
                 self.db.execute(
@@ -243,6 +296,19 @@ class Daemon:
                     "VALUES (?, ?, 'merge', 'COMPLETED', 'CONFLICT', ?)",
                     (repo_name, pr_num, now),
                 )
+
+            # Cascade detection: merged PRs may have caused other PRs to conflict
+            if merged_prs:
+                for repo_name, pr_num in conflicts:
+                    # For each newly conflicting PR, check if it was caused by a merge
+                    for merged_num in merged_prs:
+                        if pr_num != merged_num:
+                            notify_events.append(CascadeUnmergable(
+                                repo_name, pr_num, merged_num,
+                            ))
+                            break  # one cascade event per PR
+
+        return notify_events
 
     def _load_current_jobs(self, owner_repo: str) -> dict:
         """Load latest ci_events per (repo, pr, job) for diffing."""
@@ -308,7 +374,7 @@ class Daemon:
         ).fetchall()
 
         for (status,) in rows:
-            if status in ("QUEUED", "IN_PROGRESS"):
+            if status in ACTIVE_STATUSES:
                 has_active_ci = True
             has_open_prs = True
 
@@ -330,6 +396,40 @@ class Daemon:
 # ═══════════════════════════════════════════════════════════════════════════
 # Helpers
 # ═══════════════════════════════════════════════════════════════════════════
+
+def _add_ci_completion(
+    events: list[NotificationEvent],
+    owner_repo: str,
+    pr_number: int,
+    db: sqlite3.Connection,
+    current_jobs: dict,
+) -> None:
+    """Check if all CI jobs for a PR are complete and emit CiCompleted event.
+
+    Called once per COMPLETED ci_event. Checks if this was the last
+    non-terminal job for the PR.
+    """
+    # Get latest status for all jobs on this PR
+    rows = db.execute(
+        "SELECT job_name, status, conclusion FROM ci_events "
+        "WHERE owner_repo = ? AND pr_number = ? "
+        "GROUP BY job_name HAVING recorded_at = MAX(recorded_at)",
+        (owner_repo, pr_number),
+    ).fetchall()
+
+    # Check if all jobs are in a terminal state
+    all_done = all(status in TERMINAL_STATUSES for _, status, _ in rows)
+    if not all_done:
+        return
+
+    # Determine overall conclusion
+    conclusions = {c for _, _, c in rows if c}
+    if CONCLUSION_FAILURE in conclusions:
+        failed = [name for name, _, c in rows if c == CONCLUSION_FAILURE]
+        events.append(CiCompleted(owner_repo, pr_number, CONCLUSION_FAILURE, failed))
+    elif conclusions == {CONCLUSION_SUCCESS}:
+        events.append(CiCompleted(owner_repo, pr_number, CONCLUSION_SUCCESS))
+
 
 def _is_pid_alive(pid: int) -> bool:
     """Check if a process is alive. Cross-platform.

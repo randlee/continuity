@@ -17,6 +17,13 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+from constants import (
+    STATUS_QUEUED, STATUS_IN_PROGRESS, STATUS_COMPLETED,
+    CONCLUSION_SUCCESS, CONCLUSION_FAILURE,
+    PR_STATE_OPEN,
+    ACTIVE_STATUSES,
+)
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # continuity status (FR-39)
@@ -66,27 +73,27 @@ def cmd_status(db: sqlite3.Connection) -> str:
 def _pr_mode(jobs: list[tuple]) -> str:
     """Determine PR mode from job states."""
     statuses = {s for _, s, _ in jobs}
-    if statuses & {"QUEUED", "IN_PROGRESS"}:
+    if statuses & ACTIVE_STATUSES:
         return "ACTIVE"
-    if statuses & {"COMPLETED"}:
+    if statuses & {STATUS_COMPLETED}:
         conclusions = {c for _, _, c in jobs if c}
-        if conclusions == {"SUCCESS"}:
+        if conclusions == {CONCLUSION_SUCCESS}:
             return "SUCCESS"
-        if "FAILURE" in conclusions:
+        if CONCLUSION_FAILURE in conclusions:
             return "FAILED"
     return "PENDING"
 
 
 def _job_symbol(name: str, status: str, conclusion: str | None) -> str:
-    """Render a job as a compact symbol: build✓, test⧗, lint✗."""
-    if conclusion == "SUCCESS":
-        mark = "✓"
-    elif conclusion == "FAILURE":
-        mark = "✗"
-    elif status == "IN_PROGRESS":
-        mark = "⧗"
-    elif status in ("QUEUED", "PENDING"):
-        mark = "⧗"
+    """Render a job as a compact symbol: build\u2713, test\u29d7, lint\u2717."""
+    if conclusion == CONCLUSION_SUCCESS:
+        mark = "\u2713"
+    elif conclusion == CONCLUSION_FAILURE:
+        mark = "\u2717"
+    elif status == STATUS_IN_PROGRESS:
+        mark = "\u29d7"
+    elif status in (STATUS_QUEUED, "PENDING"):
+        mark = "\u29d7"
     else:
         mark = "?"
     return f"{name}{mark}"
@@ -100,13 +107,13 @@ def _activity_mode(db: sqlite3.Connection) -> str:
         "HAVING recorded_at = MAX(recorded_at)"
     ).fetchall()
 
-    if any(s in ("QUEUED", "IN_PROGRESS") for (s,) in rows):
+    if any(s in ACTIVE_STATUSES for (s,) in rows):
         return "ACTIVE"
     if rows:
         return "WATCHFUL"
 
     open_count = db.execute(
-        "SELECT COUNT(*) FROM pull_requests WHERE state = 'OPEN'"
+        "SELECT COUNT(*) FROM pull_requests WHERE state = ?", (PR_STATE_OPEN,)
     ).fetchone()[0]
     if open_count > 0:
         return "WATCHFUL"
@@ -191,7 +198,7 @@ def cmd_history(db: sqlite3.Connection, owner_repo: str, limit: int = 20) -> str
             "GROUP BY job_name HAVING recorded_at = MAX(recorded_at)",
             (owner_repo, pr_num),
         ).fetchall()
-        outcome = "✓" if all(c[0] == "SUCCESS" for c in outcomes) else "✗" if any(c[0] == "FAILURE" for c in outcomes) else "?"
+        outcome = "\u2713" if all(c[0] == CONCLUSION_SUCCESS for c in outcomes) else "\u2717" if any(c[0] == CONCLUSION_FAILURE for c in outcomes) else "?"
 
         lines.append(f"{pr_num:>5} {branch:<25} {state:>8}  {duration:>10}  {outcome}")
 

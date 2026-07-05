@@ -10,6 +10,13 @@ Public API:
 
 from dataclasses import dataclass, field
 
+from constants import (
+    STATUS_MAP,
+    STATUS_COMPLETED,
+    MERGEABLE_CONFLICTING,
+    MERGEABLE_UNKNOWN,
+    PR_STATE_OPEN,
+)
 from gh.client import PrSnapshot, CheckRun
 
 
@@ -31,8 +38,8 @@ class CiEvent:
 class PrState:
     """Current PR state from the database."""
     number: int
-    state: str = "OPEN"
-    mergeable: str = "UNKNOWN"
+    state: str = PR_STATE_OPEN
+    mergeable: str = MERGEABLE_UNKNOWN
 
 
 @dataclass
@@ -43,15 +50,8 @@ class PrDiff:
     closed: list[PrState] = field(default_factory=list)
 
 
-# Status mapping: incoming CheckRun statuses → canonical CiEvent statuses
-STATUS_MAP = {
-    "QUEUED": "QUEUED",
-    "IN_PROGRESS": "IN_PROGRESS",
-    "COMPLETED": "COMPLETED",
-    "PENDING": "QUEUED",
-    "REQUESTED": "QUEUED",
-    "WAITING": "QUEUED",
-}
+# Status mapping: imported from constants (single source of truth)
+# Re-exported for backward compatibility with existing callers
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -143,6 +143,6 @@ def diff_conflicts(
     conflicts = []
     for pr in incoming:
         existing = current.get(pr.number)
-        if existing and existing.mergeable != "CONFLICTING" and pr.mergeable == "CONFLICTING":
+        if existing and existing.mergeable != MERGEABLE_CONFLICTING and pr.mergeable == MERGEABLE_CONFLICTING:
             conflicts.append((owner_repo, pr.number))
     return conflicts

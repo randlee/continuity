@@ -22,14 +22,16 @@ import sqlite3
 import subprocess
 import time
 
+from constants import ATM_TEAM_LEAD, ATM_CI_IDENTITY
+
 logger = logging.getLogger(__name__)
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Constants
 # ═══════════════════════════════════════════════════════════════════════════
 
-TEAM_LEAD = "team-lead"
-CI_IDENTITY = "ci"
+TEAM_LEAD = ATM_TEAM_LEAD
+CI_IDENTITY = ATM_CI_IDENTITY
 
 # Patterns in atm send stderr that indicate permanent roster failure
 _PERMANENT_FAILURE_PATTERNS = [

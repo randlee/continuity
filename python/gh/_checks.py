@@ -3,11 +3,7 @@
 import sqlite3
 import time
 
-STATUS_MAP = {
-    "QUEUED": "QUEUED", "IN_PROGRESS": "IN_PROGRESS",
-    "COMPLETED": "COMPLETED", "PENDING": "QUEUED",
-    "REQUESTED": "QUEUED", "WAITING": "QUEUED",
-}
+from constants import STATUS_MAP
 
 
 def parse_checks(db: sqlite3.Connection, repo: str, pr_num: int,
