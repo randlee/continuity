@@ -57,6 +57,16 @@ SCHEMA = """
     );
     CREATE INDEX IF NOT EXISTS idx_ci_lookup
         ON ci_events(owner_repo, pr_number, job_name, recorded_at DESC);
+
+    -- Phase 4: API usage tracking (polling daemon)
+    CREATE TABLE IF NOT EXISTS api_usage (
+        id          INTEGER PRIMARY KEY,
+        gh_account  TEXT    NOT NULL,
+        queried_at  INTEGER NOT NULL,
+        cost        INTEGER NOT NULL,
+        remaining   INTEGER NOT NULL,
+        reset_at    TEXT    NOT NULL
+    );
 """
 
 
