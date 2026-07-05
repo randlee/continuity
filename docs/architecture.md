@@ -144,6 +144,7 @@ duration. The audit trail before structured parsing.
 | `last_synced` | Unix timestamp of last poll |
 | `avg_ci_duration` | EMA of successful CI duration (seconds) |
 | `max_ci_duration` | Hard timeout ceiling |
+| `designated_member` | ATM team member for fallback notifications (NULL = `team-lead`) |
 
 ### 7.3 `pull_requests` — PR State
 
@@ -244,8 +245,8 @@ call time.
 
 **CLI surface:**
 ```
-ci atm set-notify <member>    # store designated member in continuity DB
-ci atm set-notify --reset     # remove stored value → team-lead default
+ci atm set-notify <member>    # set designated_member on repos table
+ci atm set-notify --reset     # set to NULL → team-lead default
 ci atm show-notify            # print current designated member
 ci atm status                 # validate ATM configuration
 ```

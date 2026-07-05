@@ -40,7 +40,7 @@ the CI/PR monitoring system for the Synaptic Canvas agent fleet.
 | FR-12 | `gh pr checks --json` parsed: same as statusCheckRollup |
 | FR-13 | Unknown repos auto-registered in `repos` table on first encounter |
 | FR-14 | State diffing: only write `ci_events` rows when status or conclusion differs from latest recorded |
-| FR-15 | `repos` table schema: owner_repo (unique), gh_account, last_synced, avg_ci_duration, max_ci_duration |
+| FR-15 | `repos` table schema: owner_repo (unique), gh_account, last_synced, avg_ci_duration, max_ci_duration, designated_member |
 | FR-16 | `pull_requests` table schema: owner_repo + pr_number (unique), branch, head_sha, mergeable, state, updated_at |
 | FR-17 | `ci_events` table: append-only. No UPDATE or DELETE. Index on (owner_repo, pr_number, job_name, recorded_at DESC) |
 

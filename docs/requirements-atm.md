@@ -133,25 +133,26 @@ process crash). These are retried before falling back.
 
 ## 4. Designated Member
 
-The designated member is stored in continuity's SQLite database (a
-key-value config table). If no value is stored, or the stored member is
-not in the ATM team roster, notifications fall back to `team-lead`.
+The designated member is a column on the `repos` table
+(`designated_member`). When NULL, notifications fall back to `team-lead`.
+At notification time, if the stored member is not in the ATM team roster,
+the system falls back to `team-lead`.
 
 `team-lead` resolves to the team leader for the ATM team identified by
 `ATM_TEAM`. For the `hermes` team, this is `hendrix`.
 
 | ID | Requirement |
 |---|---|
-| FR-ATM-16 | Designated member defaults to `team-lead` when no value is stored |
-| FR-ATM-17 | `ci atm set-notify <member>` stores a designated member in the continuity DB |
-| FR-ATM-18 | `ci atm set-notify --reset` removes the stored value, reverting to `team-lead` |
+| FR-ATM-16 | Designated member defaults to `team-lead` when `designated_member` is NULL |
+| FR-ATM-17 | `ci atm set-notify <member>` updates the `designated_member` column on the `repos` table |
+| FR-ATM-18 | `ci atm set-notify --reset` sets `designated_member` to NULL, reverting to `team-lead` |
 | FR-ATM-19 | `ci atm show-notify` prints the current designated member, noting whether it is stored or the default |
 | FR-ATM-20 | At notification time, if the stored member is not in the ATM roster, fall back to `team-lead` |
 
 ### Effective Fallback Chain
 
 ```
-stored designated member → team-lead → (log error)
+designated_member (repos column) → team-lead → (log error)
 ```
 
 ## 5. Message Content

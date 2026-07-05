@@ -53,17 +53,17 @@ via ATM (Agent Team Mail). The notification routing must handle:
 
 ### Designated Member
 
-The designated member is stored in continuity's SQLite database (a
-key-value config table), not in a separate config file. When no value is
-stored, the default is `team-lead`. At notification time, if the stored
-member is not in the ATM roster, the system falls back to `team-lead`.
+The designated member is the `designated_member` column on the `repos`
+table. When NULL, the default is `team-lead`. At notification time, if the
+stored member is not in the ATM roster, the system falls back to
+`team-lead`.
 
 The `team-lead` handle resolves through ATM's team roster to the actual
 agent (e.g., `hendrix` for the `hermes` team). `team-lead` is a required
 role in every ATM team — no new concept to teach.
 
 ```
-Effective fallback: stored member → team-lead → (log error)
+Effective fallback: designated_member (repos column) → team-lead → (log error)
 ```
 
 **CLI surface:**
@@ -121,12 +121,12 @@ for example, a merge cascade affects 5 PRs simultaneously.
 The fallback chain is linear and terminates:
 
 ```
-stored designated member → team-lead → (log error)
+designated_member (repos column) → team-lead → (log error)
 ```
 
-If the stored member is not set, the chain starts at `team-lead`. If
-`team-lead` is also not in the roster, continuity logs the error and
-drops the notification. No recursive fallback, no broadcast.
+If the `designated_member` column is NULL, the chain starts at
+`team-lead`. If `team-lead` is also not in the roster, continuity logs
+the error and drops the notification. No recursive fallback, no broadcast.
 
 ### Module Boundary
 
@@ -167,9 +167,9 @@ notification covers the cases that matter.
 ### E: Per-repo designated member via `.continuity.toml`
 
 Rejected as a config-file approach. The same functionality (per-repo
-designated member) is instead stored in continuity's own SQLite database,
-which already exists for the event log. No new config file, no new file
-format — just a key-value row in an existing database.
+designated member) is instead a column on the existing `repos` table.
+No new config file, no new table — just a nullable column in an existing
+schema.
 
 ## Consequences
 
