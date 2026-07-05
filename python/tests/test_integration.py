@@ -41,7 +41,12 @@ def _find_real_binary(name: str) -> str:
         return candidate
     return shutil.which(name)  # fallback
 
-pytestmark = pytest.mark.skipif(not GH_AVAILABLE, reason="gh CLI not installed")
+IN_CI = os.environ.get("CI") == "true" or os.environ.get("GITHUB_ACTIONS") == "true"
+
+pytestmark = pytest.mark.skipif(
+    not GH_AVAILABLE or IN_CI,
+    reason="gh CLI not installed or running in CI"
+)
 
 TEST_REPO = "randlee/continuity-test"
 TEST_REPO_CLONE = Path(__file__).resolve().parent.parent.parent / "continuity-test"
