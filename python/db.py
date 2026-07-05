@@ -27,6 +27,7 @@ SCHEMA = """
         owner_repo      TEXT    UNIQUE NOT NULL,
         gh_account      TEXT    NOT NULL,
         provider        TEXT    DEFAULT 'github',
+        designated_member TEXT,
         last_synced     INTEGER,
         avg_ci_duration INTEGER,
         max_ci_duration INTEGER
@@ -77,5 +78,14 @@ def ensure_db(db_path: Path) -> sqlite3.Connection:
     db.execute("PRAGMA journal_mode=WAL")
     db.execute("PRAGMA busy_timeout=2000")
     db.executescript(SCHEMA)
+    _run_migrations(db)
     db.commit()
     return db
+
+
+def _run_migrations(db: sqlite3.Connection) -> None:
+    """Apply schema migrations for existing databases."""
+    # Migration 001: add designated_member column to repos
+    cols = [row[1] for row in db.execute("PRAGMA table_info(repos)").fetchall()]
+    if "designated_member" not in cols:
+        db.execute("ALTER TABLE repos ADD COLUMN designated_member TEXT")

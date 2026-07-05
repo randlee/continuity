@@ -328,3 +328,97 @@ class TestAdr:
         assert conn.execute(
             "SELECT 1 FROM repos WHERE owner_repo = 'neworg/newrepo'"
         ).fetchone() is not None
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# ATM CLI commands
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestAtmCli:
+    """Tests for ATM CLI commands: set-notify, show-notify, status."""
+
+    def test_set_notify_stores_member(self, conn):
+        """cmd_atm_set_notify updates designated_member on repos table."""
+        from cli.daemon_cmd import cmd_atm_set_notify
+        output = cmd_atm_set_notify(conn, "owner/repo", "rand")
+        assert "set to rand" in output
+
+        row = conn.execute(
+            "SELECT designated_member FROM repos WHERE owner_repo = 'owner/repo'"
+        ).fetchone()
+        assert row[0] == "rand"
+
+    def test_set_notify_reset_clears_member(self, conn):
+        """cmd_atm_set_notify --reset sets designated_member to NULL."""
+        from cli.daemon_cmd import cmd_atm_set_notify
+
+        # Set first
+        cmd_atm_set_notify(conn, "owner/repo", "rand")
+        # Then reset
+        output = cmd_atm_set_notify(conn, "owner/repo", "--reset")
+        assert "reset to team-lead" in output
+
+        row = conn.execute(
+            "SELECT designated_member FROM repos WHERE owner_repo = 'owner/repo'"
+        ).fetchone()
+        assert row[0] is None
+
+    def test_set_notify_rejects_invalid_name(self, conn):
+        """cmd_atm_set_notify rejects names with spaces or empty."""
+        from cli.daemon_cmd import cmd_atm_set_notify
+
+        output = cmd_atm_set_notify(conn, "owner/repo", "bad name")
+        assert "Invalid" in output
+
+        output = cmd_atm_set_notify(conn, "owner/repo", "")
+        assert "Invalid" in output
+
+    def test_show_notify_reports_default(self, conn):
+        """cmd_atm_show_notify shows team-lead when NULL."""
+        from cli.daemon_cmd import cmd_atm_show_notify
+        output = cmd_atm_show_notify(conn, "owner/repo")
+        assert "team-lead (default)" in output
+
+    def test_show_notify_reports_custom(self, conn):
+        """cmd_atm_show_notify shows stored member."""
+        # Seed a repo with a custom designated member
+        conn.execute(
+            "INSERT INTO repos (owner_repo, gh_account, designated_member) "
+            "VALUES ('test/repo', 'test', 'custom-agent')"
+        )
+        conn.commit()
+
+        from cli.daemon_cmd import cmd_atm_show_notify
+        output = cmd_atm_show_notify(conn, "test/repo")
+        assert "custom-agent" in output
+        assert "default" not in output
+
+    def test_show_notify_unknown_repo(self, conn):
+        """cmd_atm_show_notify reports unregistered repo."""
+        from cli.daemon_cmd import cmd_atm_show_notify
+        output = cmd_atm_show_notify(conn, "nonexistent/repo")
+        assert "not registered" in output
+
+    def test_atm_status_not_configured(self, monkeypatch):
+        """cmd_atm_status reports NOT CONFIGURED when ATM_TEAM is unset."""
+        monkeypatch.delenv("ATM_TEAM", raising=False)
+        import shutil as _shutil
+        monkeypatch.setattr(_shutil, "which", lambda _: None)
+        monkeypatch.setattr("os.path.isfile", lambda _: False)
+
+        from cli.daemon_cmd import cmd_atm_status
+        output = cmd_atm_status()
+        assert "NOT CONFIGURED" in output
+        assert "not set" in output
+
+    def test_atm_status_ready(self, monkeypatch):
+        """cmd_atm_status reports READY when configured."""
+        monkeypatch.setenv("ATM_TEAM", "hermes")
+        monkeypatch.setenv("ATM_IDENTITY", "ci")
+        import shutil as _shutil
+        monkeypatch.setattr(_shutil, "which", lambda _: "/opt/homebrew/bin/atm")
+
+        from cli.daemon_cmd import cmd_atm_status
+        output = cmd_atm_status()
+        assert "READY" in output
+        assert "ATM_TEAM=hermes" in output

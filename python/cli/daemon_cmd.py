@@ -258,3 +258,85 @@ def _format_ts(unix_ts: int) -> str:
     if not unix_ts:
         return "-"
     return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(unix_ts))
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# ATM commands — designated member management
+# ═══════════════════════════════════════════════════════════════════════════
+
+def cmd_atm_set_notify(db: sqlite3.Connection, owner_repo: str,
+                       member: str | None) -> str:
+    """Set or reset designated_member for a repo.
+    member=None or '--reset' resets to team-lead default.
+    """
+    if member is None or member == "--reset":
+        db.execute(
+            "UPDATE repos SET designated_member = NULL WHERE owner_repo = ?",
+            (owner_repo,),
+        )
+        db.commit()
+        return f"Designated member for {owner_repo} reset to team-lead (default)\n"
+
+    # Basic validation: no spaces, reasonable length
+    member = member.strip()
+    if not member or " " in member or len(member) > 64:
+        return f"Invalid member name: '{member}'. Must be a single, non-empty ATM identity.\n"
+
+    db.execute(
+        "UPDATE repos SET designated_member = ? WHERE owner_repo = ?",
+        (member, owner_repo),
+    )
+    db.commit()
+    return f"Designated member for {owner_repo} set to {member}\n"
+
+
+def cmd_atm_show_notify(db: sqlite3.Connection, owner_repo: str) -> str:
+    """Show current designated member for a repo."""
+    row = db.execute(
+        "SELECT designated_member FROM repos WHERE owner_repo = ?",
+        (owner_repo,),
+    ).fetchone()
+
+    if row is None:
+        return f"Repo {owner_repo} is not registered. Use 'continuity register' first.\n"
+
+    member = row[0]
+    if member:
+        return f"Designated member for {owner_repo}: {member}\n"
+    return f"Designated member for {owner_repo}: team-lead (default)\n"
+
+
+def cmd_atm_status() -> str:
+    """Check ATM configuration status."""
+    import os
+    import shutil
+
+    issues = []
+
+    team = os.environ.get("ATM_TEAM")
+    if not team:
+        issues.append("ATM_TEAM not set")
+    else:
+        issues.append(f"ATM_TEAM={team} ✓")
+
+    identity = os.environ.get("ATM_IDENTITY", "ci")
+    issues.append(f"ATM_IDENTITY={identity} ✓")
+
+    if shutil.which("atm") or os.path.isfile("/opt/homebrew/bin/atm"):
+        issues.append("atm binary found ✓")
+    else:
+        issues.append("atm binary NOT found ✗")
+
+    lines = ["ATM Configuration:"]
+    lines.append("-" * 40)
+    for issue in issues:
+        lines.append(f"  {issue}")
+
+    if "NOT found" in "\n".join(issues) or "not set" in "\n".join(issues):
+        lines.append("")
+        lines.append("Status: NOT CONFIGURED")
+        return "\n".join(lines) + "\n"
+
+    lines.append("")
+    lines.append("Status: READY")
+    return "\n".join(lines) + "\n"
