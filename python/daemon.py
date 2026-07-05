@@ -81,6 +81,11 @@ class Daemon:
         self._shutdown_flag = False
         self._wake_event = False
         self._pid_file = self.home / "daemon.pid"
+        # Monitor state: EMA tracking per (repo, job_name)
+        self._ema: dict[tuple[str, str], float] = {}
+        self._ema_count: dict[tuple[str, str], int] = {}
+        # Dedup: prevent duplicate slow/timeout notifications per CI run
+        self._notified_monitor: set[tuple[str, int, str, str]] = set()
 
     # ── Lifecycle ────────────────────────────────────────────────────────
 
@@ -174,6 +179,12 @@ class Daemon:
 
     # ── Poll cycle ───────────────────────────────────────────────────────
 
+    # EMA configuration
+    EMA_ALPHA = 0.2
+    EMA_MIN_SAMPLES = 3
+    SLOW_THRESHOLD = 2.0   # 2× EMA
+    HUNG_THRESHOLD = 5.0   # 5× EMA
+
     def _poll_cycle(self):
         """Query all accounts, diff results, write to DB, dispatch notifications."""
         now = int(time.time())
@@ -193,6 +204,10 @@ class Daemon:
             notify_events.extend(events)
 
         self.db.commit()
+
+        # Check monitor for slow/timeout jobs
+        monitor_events = self._check_monitor(now)
+        notify_events.extend(monitor_events)
 
         # Dispatch notifications in a spawned thread (non-blocking)
         if notify_events:
@@ -240,6 +255,9 @@ class Daemon:
                 if e.status == STATUS_COMPLETED:
                     _add_ci_completion(notify_events, owner_repo, e.pr_number,
                                        self.db, current_jobs)
+                    # Update EMA on successful completion
+                    if e.conclusion == CONCLUSION_SUCCESS:
+                        self._update_ema(owner_repo, e.job_name, now)
 
             # Diff PRs
             pr_diff = diff_prs(prs, current_prs)
@@ -337,6 +355,116 @@ class Daemon:
         ).fetchall()
         return {r[0]: PrState(number=r[0], state=r[1], mergeable=r[2] or "UNKNOWN")
                 for r in rows}
+
+    # ── Monitor: EMA tracking and slow/timeout detection ────────────────
+
+    def _update_ema(self, owner_repo: str, job_name: str, now: int) -> None:
+        """Update EMA for a job that completed successfully.
+
+        Calculates execution time from the IN_PROGRESS→COMPLETED delta
+        in ci_events, then updates the running EMA.
+        Requires EMA_MIN_SAMPLES before thresholds apply.
+        """
+        key = (owner_repo, job_name)
+
+        # Find the IN_PROGRESS timestamp for this job run
+        started = self.db.execute(
+            "SELECT recorded_at FROM ci_events "
+            "WHERE owner_repo = ? AND job_name = ? AND status = ? "
+            "ORDER BY recorded_at DESC LIMIT 1",
+            (owner_repo, job_name, STATUS_IN_PROGRESS),
+        ).fetchone()
+
+        # Find the COMPLETED timestamp (latest before now)
+        completed = self.db.execute(
+            "SELECT recorded_at FROM ci_events "
+            "WHERE owner_repo = ? AND job_name = ? AND status = ? "
+            "ORDER BY recorded_at DESC LIMIT 1",
+            (owner_repo, job_name, STATUS_COMPLETED),
+        ).fetchone()
+
+        if not started or not completed:
+            return
+
+        execution_s = completed[0] - started[0]
+        if execution_s <= 0:
+            return
+
+        count = self._ema_count.get(key, 0) + 1
+        self._ema_count[key] = count
+
+        current = self._ema.get(key, 0.0)
+        if count == 1:
+            self._ema[key] = float(execution_s)  # seed with first value
+        else:
+            self._ema[key] = (
+                self.EMA_ALPHA * execution_s +
+                (1.0 - self.EMA_ALPHA) * current
+            )
+
+        # Clear dedup entries for this job (new CI run starting)
+        to_remove = {
+            k for k in self._notified_monitor
+            if k[0] == owner_repo and k[2] == job_name
+        }
+        self._notified_monitor -= to_remove
+
+    def _check_monitor(self, now: int) -> list[NotificationEvent]:
+        """Check all IN_PROGRESS jobs for slow/hung conditions.
+
+        Returns CiSlow/CiTimeout events. Deduplicated — each
+        (repo, pr, job, event_type) fires at most once per CI run.
+        """
+        events: list[NotificationEvent] = []
+
+        # Find all currently IN_PROGRESS jobs
+        rows = self.db.execute(
+            "SELECT ce.owner_repo, ce.pr_number, ce.job_name, ce.recorded_at "
+            "FROM ci_events ce "
+            "INNER JOIN ("
+            "  SELECT owner_repo, pr_number, job_name, MAX(recorded_at) AS max_ts "
+            "  FROM ci_events GROUP BY owner_repo, pr_number, job_name"
+            ") latest "
+            "ON ce.owner_repo = latest.owner_repo "
+            "AND ce.pr_number = latest.pr_number "
+            "AND ce.job_name = latest.job_name "
+            "AND ce.recorded_at = latest.max_ts "
+            "WHERE ce.status = ?",
+            (STATUS_IN_PROGRESS,),
+        ).fetchall()
+
+        for owner_repo, pr_number, job_name, started_at in rows:
+            elapsed = now - started_at
+            key = (owner_repo, job_name)
+            ema = self._ema.get(key)
+            count = self._ema_count.get(key, 0)
+
+            # Skip if no EMA baseline yet (need minimum samples)
+            if ema is None or count < self.EMA_MIN_SAMPLES:
+                continue
+
+            # Check hung (timeout) — 5× EMA
+            hung_key = (owner_repo, pr_number, job_name, "timeout")
+            if elapsed > self.HUNG_THRESHOLD * ema:
+                if hung_key not in self._notified_monitor:
+                    self._notified_monitor.add(hung_key)
+                    events.append(CiTimeout(
+                        owner_repo, pr_number, job_name,
+                        int(self.HUNG_THRESHOLD * ema),
+                    ))
+                continue  # don't also emit slow if already hung
+
+            # Check slow — 2× EMA
+            slow_key = (owner_repo, pr_number, job_name, "slow")
+            if elapsed > self.SLOW_THRESHOLD * ema:
+                if slow_key not in self._notified_monitor:
+                    self._notified_monitor.add(slow_key)
+                    events.append(CiSlow(
+                        owner_repo, pr_number, job_name,
+                        elapsed, ema,
+                    ))
+
+        return events
 
     # ── Adaptive mode (FR-31, FR-32) ─────────────────────────────────────
 
