@@ -243,7 +243,48 @@ POST https://api.github.com/graphql
 Authorization: Bearer ***
 ```
 
-## 11. Key Design Decisions
+## 11. Daemon Singleton Guarantee
+
+Only one daemon process may run per `CONTINUITY_HOME`. Enforced at three
+levels:
+
+| Level | Mechanism | Failure mode |
+|---|---|---|
+| 1 | PID file (`daemon.pid`) | Fast user-facing check |
+| 2 | Exclusive file lock (`daemon.lock`) | OS-enforced; survives crashes |
+| 3 | `CONTINUITY_HOME` isolation | Tests use temp dirs; no collision |
+
+**Startup sequence:**
+1. Open `$CONTINUITY_HOME/daemon.lock` with exclusive, non-blocking lock
+2. If lock fails → read `daemon.pid` → check liveness → error if alive,
+   clear stale lock if dead
+3. Write PID to `daemon.pid`
+4. On SIGTERM: release lock, remove PID file, flush logs, exit 0
+5. On crash: OS releases lock automatically; next startup clears stale PID
+
+**Test fixture contract:**
+```python
+@pytest.fixture
+def daemon():
+    home = tempfile.mkdtemp()
+    # Start daemon, wait for ready signal (socket or health check)
+    proc = subprocess.Popen(["python", "continuity", "daemon"],
+                            env={"CONTINUITY_HOME": home})
+    wait_for_ready(proc, timeout=5)
+    yield DaemonHandle(proc.pid, home)
+
+    # Teardown (guaranteed, in order):
+    proc.terminate()           # SIGTERM
+    try:
+        proc.wait(timeout=5)   # graceful shutdown
+    except TimeoutExpired:
+        proc.kill()            # SIGKILL
+        proc.wait()
+    assert not is_pid_alive(proc.pid), f"PID {proc.pid} still alive"
+    assert not Path(home, "daemon.pid").exists(), "PID file not cleaned"
+```
+
+## 12. Key Design Decisions
 
 | Decision | Rationale |
 |---|---|
