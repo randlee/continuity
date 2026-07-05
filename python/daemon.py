@@ -16,6 +16,7 @@ import json
 import os
 import signal
 import sqlite3
+import sys
 import time
 from dataclasses import dataclass
 from enum import Enum
@@ -331,7 +332,19 @@ class Daemon:
 # ═══════════════════════════════════════════════════════════════════════════
 
 def _is_pid_alive(pid: int) -> bool:
-    """Check if a process is alive. Cross-platform."""
+    """Check if a process is alive. Cross-platform.
+    On Unix: os.kill(pid, 0) is a null signal check.
+    On Windows: os.kill(pid, 0) sends CTRL_C_EVENT — use tasklist instead."""
+    if sys.platform == "win32":
+        try:
+            import subprocess
+            proc = subprocess.run(
+                ["tasklist", "/FI", f"PID eq {pid}", "/NH"],
+                capture_output=True, text=True, timeout=5,
+            )
+            return str(pid) in proc.stdout
+        except Exception:
+            return False
     try:
         os.kill(pid, 0)
         return True

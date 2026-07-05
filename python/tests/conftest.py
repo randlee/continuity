@@ -16,6 +16,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 def _is_pid_alive(pid: int) -> bool:
     """Check if a process is alive. Cross-platform."""
+    if sys.platform == "win32":
+        try:
+            proc = subprocess.run(
+                ["tasklist", "/FI", f"PID eq {pid}", "/NH"],
+                capture_output=True, text=True, timeout=5,
+            )
+            return str(pid) in proc.stdout
+        except Exception:
+            return False
     try:
         os.kill(pid, 0)
         return True
