@@ -349,3 +349,49 @@ class TestAdrPhase3:
         captured = capsys.readouterr()
         assert "repo delete blocked" in captured.err
         assert "CONTINUITY_ALLOW_DANGEROUS" in captured.err
+
+
+class TestPrefixStripping:
+    """Corner case: -R (gh) and -C (git) prefix flags."""
+
+    def test_gh_R_prefix_pr_merge_blocked(self):
+        """gh -R owner/repo pr merge → still blocked."""
+        msg = cg.check_dangerous("gh", ["-R", "owner/repo", "pr", "merge"])
+        assert msg is not None
+        assert "pr merge blocked" in msg
+
+    def test_gh_R_prefix_pr_merge_auto_allowed(self):
+        """gh -R owner/repo pr merge --auto → allowed."""
+        msg = cg.check_dangerous("gh", ["-R", "owner/repo", "pr", "merge", "--auto"])
+        assert msg is None
+
+    def test_gh_RR_double_prefix(self):
+        """gh -R a/b -R c/d pr merge → still blocked (both stripped)."""
+        msg = cg.check_dangerous("gh", ["-R", "a/b", "-R", "c/d", "pr", "merge"])
+        assert msg is not None
+
+    def test_git_C_prefix_force_push_blocked(self):
+        """git -C /path push --force → still blocked."""
+        msg = cg.check_dangerous("git", ["-C", "/tmp/repo", "push", "--force"])
+        assert msg is not None
+        assert "force push blocked" in msg
+
+    def test_git_C_prefix_normal_push_allowed(self):
+        """git -C /path push → allowed."""
+        msg = cg.check_dangerous("git", ["-C", "/tmp/repo", "push", "origin", "main"])
+        assert msg is None
+
+    def test_git_C_prefix_branch_D_blocked(self):
+        """git -C /path branch -D x → blocked."""
+        msg = cg.check_dangerous("git", ["-C", "/tmp/repo", "branch", "-D", "x"])
+        assert msg is not None
+
+    def test_git_CC_double_prefix(self):
+        """git -C a -C b push -f → still blocked (both stripped)."""
+        msg = cg.check_dangerous("git", ["-C", "a", "-C", "b", "push", "-f"])
+        assert msg is not None
+
+    def test_gh_R_prefix_not_blocking_normal(self):
+        """gh -R owner/repo pr list → not blocked."""
+        msg = cg.check_dangerous("gh", ["-R", "owner/repo", "pr", "list"])
+        assert msg is None

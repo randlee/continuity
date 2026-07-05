@@ -4,6 +4,9 @@
 Usage:
     python3 continuity-install         # install to ~/.local/bin
     python3 continuity-install --undo  # remove
+
+Sets CONTINUITY_REAL_GH/CONTINUITY_REAL_GIT env vars in wrapper scripts
+so the interceptor always delegates to the real binaries.
 """
 
 import os
@@ -17,6 +20,7 @@ POC_DIR = Path(__file__).resolve().parent
 
 
 def resolve_binary(name: str) -> str:
+    """Find the real binary, skipping our own wrappers if already installed."""
     wrapper_path = BIN_DIR / name
     real = shutil.which(name)
     if real and os.path.realpath(real) == str(wrapper_path):
@@ -38,16 +42,15 @@ def install():
     print(f"real gh:  {real_gh}")
     print(f"real git: {real_git}")
 
-    # gh wrapper — copy + patch binary paths
-    gh_code = (POC_DIR / "continuity-gh").read_text()
-    gh_code = gh_code.replace(
-        'REAL_GH = "/opt/homebrew/bin/gh"', f'REAL_GH = {real_gh!r}'
-    ).replace(
-        'REAL_GIT = "/usr/bin/git"', f'REAL_GIT = {real_git!r}'
-    )
+    interceptor = POC_DIR / "continuity-gh"
 
+    # gh wrapper — sets env vars pointing to real binaries
     gh_path = BIN_DIR / "gh"
-    gh_path.write_text(gh_code)
+    gh_path.write_text(f"""#!/bin/bash
+export CONTINUITY_REAL_GH={real_gh}
+export CONTINUITY_REAL_GIT={real_git}
+exec {sys.executable} {interceptor} "$@"
+""")
     gh_path.chmod(gh_path.stat().st_mode | stat.S_IEXEC)
     print(f"✔ {gh_path}")
 
@@ -55,7 +58,9 @@ def install():
     git_path = BIN_DIR / "git"
     git_path.write_text(f"""#!/bin/bash
 export CONTINUITY_COMMAND=git
-exec python3 {gh_path} "$@"
+export CONTINUITY_REAL_GH={real_gh}
+export CONTINUITY_REAL_GIT={real_git}
+exec {sys.executable} {interceptor} "$@"
 """)
     git_path.chmod(git_path.stat().st_mode | stat.S_IEXEC)
     print(f"✔ {git_path}")

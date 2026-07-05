@@ -17,6 +17,12 @@ import sys
 import time
 from pathlib import Path
 
+# Ensure the install directory is on sys.path so sibling modules resolve.
+# When installed via continuity-install, the whole python/ dir is copied.
+_install_dir = str(Path(__file__).resolve().parent)
+if _install_dir not in sys.path:
+    sys.path.insert(0, _install_dir)
+
 from db import ensure_db, SCHEMA
 from runner import resolve_binary, run_binary
 from block import check_dangerous
@@ -25,8 +31,8 @@ import git
 
 # ── Resolved at module load ────────────────────────────────────────────────
 
-REAL_GH = resolve_binary("gh")
-REAL_GIT = resolve_binary("git")
+REAL_GH = os.environ.get("CONTINUITY_REAL_GH", resolve_binary("gh"))
+REAL_GIT = os.environ.get("CONTINUITY_REAL_GIT", resolve_binary("git"))
 
 
 def _data_dir() -> Path:
@@ -41,7 +47,9 @@ def _data_dir() -> Path:
     return Path.home() / ".local" / "share" / "continuity"
 
 
-DB_PATH = _data_dir() / "continuity.db"
+def _resolve_db_path() -> Path:
+    """Resolve DB path at call time (respects CONTINUITY_DB env override)."""
+    return Path(os.environ.get("CONTINUITY_DB", str(_data_dir() / "continuity.db")))
 
 
 # ── Core interception ──────────────────────────────────────────────────────
@@ -98,14 +106,17 @@ def _ensure_repo(db, owner_repo: str) -> None:
     )
 
 
-def _repo_fn(real_gh: str):
-    """Returns a callable that lazily detects and caches the current repo."""
+def _repo_fn(real_gh: str, db):
+    """Returns a callable that lazily detects, caches, and auto-registers
+    the current repo. Any parser calling this gets auto-registration for free."""
     cache = ""
 
     def fn():
         nonlocal cache
         if not cache:
             cache = _detect_repo(real_gh)
+            if cache:
+                _ensure_repo(db, cache)
         return cache
 
     return fn
@@ -174,7 +185,7 @@ def intercept(command: str, args: list[str], real_binary: str,
     # Phase 2: structured parsing (post-hoc, never affects exit code)
     try:
         if command == "gh":
-            gh.parse(args, proc.stdout, db, _repo_fn(real_binary), _ensure_repo_fn(db))
+            gh.parse(args, proc.stdout, db, _repo_fn(real_binary, db), _ensure_repo_fn(db))
         elif command == "git":
             git.parse(args, db)
     except Exception:
@@ -195,7 +206,7 @@ def main():
     command = os.environ.get("CONTINUITY_COMMAND", "gh")
     real_binary = REAL_GH if command == "gh" else REAL_GIT
     args = sys.argv[1:]
-    exit_code = intercept(command, args, real_binary, DB_PATH)
+    exit_code = intercept(command, args, real_binary, _resolve_db_path())
     sys.exit(exit_code)
 
 

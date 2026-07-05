@@ -13,11 +13,27 @@ from pathlib import Path
 
 
 def resolve_binary(name: str) -> str:
-    """Resolve real gh/git binary path, platform-aware."""
+    """Resolve real gh/git binary path, platform-aware.
+    Skips continuity wrapper scripts to avoid infinite recursion."""
     if sys.platform == "win32":
         name = f"{name}.exe"
     resolved = shutil.which(name)
     if resolved:
+        # Check if resolved path is a continuity wrapper — skip it
+        try:
+            content = Path(resolved).read_text()
+            if "continuity" in content.lower():
+                # This is our wrapper — find the real binary by scanning PATH
+                paths = os.environ.get("PATH", "").split(os.pathsep)
+                for p in paths:
+                    # Skip the directory containing this wrapper and ~/.local/bin
+                    if p == str(Path(resolved).parent) or ".local/bin" in p:
+                        continue
+                    candidate = os.path.join(p, name)
+                    if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+                        return candidate
+        except (OSError, UnicodeDecodeError):
+            pass
         return resolved
     if sys.platform == "win32":
         base = os.environ.get("LOCALAPPDATA",

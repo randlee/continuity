@@ -171,3 +171,21 @@ class TestAdr:
         parse_view(conn, ["pr", "view", "1", "--json", "..."], stdout1, _repo_fn)
         parse_view(conn, ["pr", "view", "1", "--json", "..."], stdout2, _repo_fn)
         assert conn.execute("SELECT COUNT(*) FROM ci_events").fetchone()[0] == 2
+
+
+class TestRPrefix:
+    """Corner case: gh -R owner/repo prefix in args."""
+
+    def test_R_prefix_pr_view_parses(self, conn):
+        """gh -R owner/repo pr view --json → still parses correctly."""
+        parse_view(conn, ["-R", "other/repo", "pr", "view", "42", "--json", "..."],
+                   PR_VIEW_JSON, _repo_fn)
+        pr = conn.execute("SELECT pr_number FROM pull_requests").fetchone()
+        assert pr[0] == 42
+
+    def test_RR_double_prefix(self, conn):
+        """gh -R a/b -R c/d pr view → still parses (both stripped)."""
+        parse_view(conn, ["-R", "a/b", "-R", "c/d", "pr", "view", "42", "--json", "..."],
+                   PR_VIEW_JSON, _repo_fn)
+        pr = conn.execute("SELECT pr_number FROM pull_requests").fetchone()
+        assert pr[0] == 42

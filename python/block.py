@@ -59,37 +59,48 @@ def check_dangerous(command: str, args: list[str]) -> str | None:
     if not args:
         return None
 
-    # Gh commands: check (gh, subcommand, ...) patterns
+    # Gh commands: strip -R <repo> prefix, then check patterns
     if command == "gh":
-        for depth in range(1, min(len(args) + 1, 4)):
-            pattern = (command,) + tuple(args[:depth])
+        idx = 0
+        while idx < len(args) - 1 and args[idx] == "-R":
+            idx += 2
+        effective = args[idx:] if idx < len(args) else []
+
+        for depth in range(1, min(len(effective) + 1, 4)):
+            pattern = (command,) + tuple(effective[:depth])
             if pattern in _PATTERNS:
-                if pattern == ("gh", "pr", "merge") and "--auto" in args:
+                if pattern == ("gh", "pr", "merge") and "--auto" in effective:
                     return None
                 if pattern == ("gh", "api"):
-                    return _check_api_method(args)
+                    return _check_api_method(effective)
                 return _PATTERNS[pattern]
 
-        if args[0] == "api":
-            return _check_api_method(args)
+        if effective and effective[0] == "api":
+            return _check_api_method(effective)
         return None
 
-    # Git commands: exact patterns + flag scanning
+    # Git commands: strip -C <path> prefix, then check patterns + flags
     if command == "git":
+        # Skip -C <path> prefix (git -C /some/path push ...)
+        idx = 0
+        while idx < len(args) - 1 and args[idx] == "-C":
+            idx += 2
+        effective = args[idx:] if idx < len(args) else []
+
         for pattern, msg in _PATTERNS.items():
             if pattern[0] != "git":
                 continue
             pat_args = list(pattern[1:])
-            if len(args) >= len(pat_args):
-                if all(args[i] == pat_args[i] for i in range(len(pat_args))):
+            if len(effective) >= len(pat_args):
+                if all(effective[i] == pat_args[i] for i in range(len(pat_args))):
                     return msg
 
-        if args[0] == "push" and "--force-with-lease" not in args:
-            for a in args:
+        if effective and effective[0] == "push" and "--force-with-lease" not in effective:
+            for a in effective:
                 if a in ("--force", "-f"):
                     return _PATTERNS[("git", "push", "--force")]
 
-        if args[0] == "push" and "--delete" in args:
+        if effective and effective[0] == "push" and "--delete" in effective:
             return _PATTERNS[("git", "push", "--delete")]
 
     return None
