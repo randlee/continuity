@@ -133,19 +133,26 @@ process crash). These are retried before falling back.
 
 ## 4. Designated Member
 
-The designated member is **always `team-lead`**. There is no per-repo
-configuration file and no persistence mechanism.
+The designated member is stored in continuity's SQLite database (a
+key-value config table). If no value is stored, or the stored member is
+not in the ATM team roster, notifications fall back to `team-lead`.
 
 `team-lead` resolves to the team leader for the ATM team identified by
 `ATM_TEAM`. For the `hermes` team, this is `hendrix`.
 
 | ID | Requirement |
 |---|---|
-| FR-ATM-16 | Designated member is always `team-lead` — no configuration mechanism |
+| FR-ATM-16 | Designated member defaults to `team-lead` when no value is stored |
+| FR-ATM-17 | `ci atm set-notify <member>` stores a designated member in the continuity DB |
+| FR-ATM-18 | `ci atm set-notify --reset` removes the stored value, reverting to `team-lead` |
+| FR-ATM-19 | `ci atm show-notify` prints the current designated member, noting whether it is stored or the default |
+| FR-ATM-20 | At notification time, if the stored member is not in the ATM roster, fall back to `team-lead` |
 
-*Future extension:* a `ci atm set-notify <member>` runtime override
-(in-memory only, resets on daemon restart) may be added if per-repo
-routing divergence becomes necessary. This is not part of v1.
+### Effective Fallback Chain
+
+```
+stored designated member → team-lead → (log error)
+```
 
 ## 5. Message Content
 
@@ -218,12 +225,16 @@ pr:
 
 | Command | Description |
 |---|---|
+| `ci atm set-notify <member>` | Store designated member in continuity DB |
+| `ci atm set-notify --reset` | Remove stored member, revert to `team-lead` default |
+| `ci atm show-notify` | Print current designated member (stored or default) |
 | `ci atm status` | Check ATM configuration: `ATM_TEAM` and `ATM_IDENTITY` set, team exists, `ci` in roster |
 
 | ID | Requirement |
 |---|---|
 | FR-ATM-26 | `ci atm status` exits 0 when fully configured, non-zero otherwise |
 | FR-ATM-27 | `ci atm status` reports which preconditions are missing |
+| FR-ATM-28 | `ci atm set-notify <member>` validates the member is a valid ATM identity string but does not validate roster membership (roster validation happens at send time) |
 
 ## 7. Non-Functional Requirements
 

@@ -244,6 +244,9 @@ call time.
 
 **CLI surface:**
 ```
+ci atm set-notify <member>    # store designated member in continuity DB
+ci atm set-notify --reset     # remove stored value → team-lead default
+ci atm show-notify            # print current designated member
 ci atm status                 # validate ATM configuration
 ```
 

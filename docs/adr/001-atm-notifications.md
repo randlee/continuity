@@ -53,17 +53,30 @@ via ATM (Agent Team Mail). The notification routing must handle:
 
 ### Designated Member
 
-The designated member is **always `team-lead`**. No per-repo configuration
-file. No persistence. The `team-lead` handle resolves through ATM's team
-roster to the actual agent (e.g., `hendrix` for the `hermes` team).
+The designated member is stored in continuity's SQLite database (a
+key-value config table), not in a separate config file. When no value is
+stored, the default is `team-lead`. At notification time, if the stored
+member is not in the ATM roster, the system falls back to `team-lead`.
 
-Rationale: a single well-known triage point covers all unowned events
-without the overhead of a config file. `team-lead` is already a required
+The `team-lead` handle resolves through ATM's team roster to the actual
+agent (e.g., `hendrix` for the `hermes` team). `team-lead` is a required
 role in every ATM team — no new concept to teach.
 
-A `ci atm set-notify <member>` runtime override (in-memory, daemon session
-only) may be added later if per-repo divergence becomes necessary. This is
-deferred to a future ADR.
+```
+Effective fallback: stored member → team-lead → (log error)
+```
+
+**CLI surface:**
+```
+ci atm set-notify <member>     # store in continuity DB
+ci atm set-notify --reset       # remove stored value → team-lead default
+ci atm show-notify              # print current state (stored or "team-lead (default)")
+```
+
+`set-notify` validates the member name is a well-formed ATM identity but
+does not validate roster membership — that happens at send time when the
+ATM CLI can authoritatively report the error. This avoids a TOCTOU race
+between set-notify and the actual notification.
 
 ### Identity Model
 
@@ -108,11 +121,12 @@ for example, a merge cascade affects 5 PRs simultaneously.
 The fallback chain is linear and terminates:
 
 ```
-ATM_IDENTITY → team-lead → (log error)
+stored designated member → team-lead → (log error)
 ```
 
-It never loops. If `team-lead` is also not in the roster, continuity logs
-the error and drops the notification. No recursive fallback, no broadcast.
+If the stored member is not set, the chain starts at `team-lead`. If
+`team-lead` is also not in the roster, continuity logs the error and
+drops the notification. No recursive fallback, no broadcast.
 
 ### Module Boundary
 
@@ -152,9 +166,10 @@ notification covers the cases that matter.
 
 ### E: Per-repo designated member via `.continuity.toml`
 
-Rejected. Adds a config file for a single value. The default (`team-lead`)
-covers all current cases. If per-repo divergence is needed later, a
-runtime override (in-memory only) is simpler than a persisted config file.
+Rejected as a config-file approach. The same functionality (per-repo
+designated member) is instead stored in continuity's own SQLite database,
+which already exists for the event log. No new config file, no new file
+format — just a key-value row in an existing database.
 
 ## Consequences
 
