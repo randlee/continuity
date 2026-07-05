@@ -402,9 +402,7 @@ class TestAtmCli:
     def test_atm_status_not_configured(self, monkeypatch):
         """cmd_atm_status reports NOT CONFIGURED when ATM_TEAM is unset."""
         monkeypatch.delenv("ATM_TEAM", raising=False)
-        import shutil as _shutil
-        monkeypatch.setattr(_shutil, "which", lambda _: None)
-        monkeypatch.setattr("os.path.isfile", lambda _: False)
+        monkeypatch.setattr("atm._atm_binary", lambda: None)
 
         from cli.daemon_cmd import cmd_atm_status
         output = cmd_atm_status()
@@ -415,8 +413,7 @@ class TestAtmCli:
         """cmd_atm_status reports READY when configured."""
         monkeypatch.setenv("ATM_TEAM", "hermes")
         monkeypatch.setenv("ATM_IDENTITY", "ci")
-        import shutil as _shutil
-        monkeypatch.setattr(_shutil, "which", lambda _: "/opt/homebrew/bin/atm")
+        monkeypatch.setattr("atm._atm_binary", lambda: "/usr/local/bin/atm")
 
         from cli.daemon_cmd import cmd_atm_status
         output = cmd_atm_status()

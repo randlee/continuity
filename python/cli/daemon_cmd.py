@@ -11,6 +11,7 @@ Public API: each command is a function that takes (db, args) and returns
 formatted output string. Testable with temp SQLite DBs.
 """
 
+import os
 import sqlite3
 import time
 from dataclasses import dataclass
@@ -308,8 +309,7 @@ def cmd_atm_show_notify(db: sqlite3.Connection, owner_repo: str) -> str:
 
 def cmd_atm_status() -> str:
     """Check ATM configuration status."""
-    import os
-    import shutil
+    from atm import atm_configured, CI_IDENTITY
 
     issues = []
 
@@ -319,10 +319,10 @@ def cmd_atm_status() -> str:
     else:
         issues.append(f"ATM_TEAM={team} ✓")
 
-    identity = os.environ.get("ATM_IDENTITY", "ci")
+    identity = os.environ.get("ATM_IDENTITY", CI_IDENTITY)
     issues.append(f"ATM_IDENTITY={identity} ✓")
 
-    if shutil.which("atm") or os.path.isfile("/opt/homebrew/bin/atm"):
+    if atm_configured():
         issues.append("atm binary found ✓")
     else:
         issues.append("atm binary NOT found ✗")
