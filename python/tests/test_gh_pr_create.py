@@ -16,7 +16,9 @@ from gh.pr_create import parse
 def conn():
     with tempfile.TemporaryDirectory() as td:
         db_path = Path(td) / "test.db"
-        yield db.ensure_db(db_path)
+        c = db.ensure_db(db_path)
+        yield c
+        c.close()
 
 
 def _ensure_repo(conn, owner_repo):

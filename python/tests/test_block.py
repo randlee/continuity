@@ -28,7 +28,7 @@ def fake_gh():
 
 @pytest.fixture
 def db_path():
-    with tempfile.TemporaryDirectory() as td:
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
         yield Path(td) / "test-continuity.db"
 
 

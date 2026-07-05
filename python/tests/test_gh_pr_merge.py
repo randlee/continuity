@@ -24,6 +24,7 @@ def conn():
         )
         c.commit()
         yield c
+        c.close()
 
 
 def _repo_fn():

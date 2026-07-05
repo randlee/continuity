@@ -18,7 +18,9 @@ from gh.pr_checks import parse as parse_checks
 def conn():
     with tempfile.TemporaryDirectory() as td:
         db_path = Path(td) / "test.db"
-        yield db.ensure_db(db_path)
+        c = db.ensure_db(db_path)
+        yield c
+        c.close()
 
 
 def _repo_fn():

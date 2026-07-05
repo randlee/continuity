@@ -12,14 +12,16 @@ import db
 
 
 @pytest.fixture
-def db_path():
+def conn():
     with tempfile.TemporaryDirectory() as td:
-        yield Path(td) / "test.db"
+        db_path = Path(td) / "test.db"
+        c = db.ensure_db(db_path)
+        yield c
+        c.close()
 
 
 class TestSchema:
-    def test_creates_tables(self, db_path):
-        conn = db.ensure_db(db_path)
+    def test_creates_tables(self, conn):
         tables = conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
         ).fetchall()
@@ -29,38 +31,36 @@ class TestSchema:
         assert "pull_requests" in names
         assert "ci_events" in names
 
-    def test_idempotent(self, db_path):
-        db.ensure_db(db_path)
+    def test_idempotent(self, conn):
+        # ensure_db already called by fixture; calling again is idempotent
+        db_path = Path(conn.execute("PRAGMA database_list").fetchone()[2])
         db.ensure_db(db_path)  # no error
 
-    def test_creates_parent_dir(self, db_path):
-        nested = db_path.parent / "nested" / "deep" / "test.db"
-        db.ensure_db(nested)
-        assert nested.exists()
+    def test_creates_parent_dir(self):
+        with tempfile.TemporaryDirectory() as td:
+            nested = Path(td) / "nested" / "deep" / "test.db"
+            conn = db.ensure_db(nested)
+            assert nested.exists()
+            conn.close()
 
-    def test_wal_mode(self, db_path):
-        conn = db.ensure_db(db_path)
+    def test_wal_mode(self, conn):
         mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
         assert mode.lower() == "wal"
 
-    def test_cli_events_has_blocked_column(self, db_path):
-        conn = db.ensure_db(db_path)
+    def test_cli_events_has_blocked_column(self, conn):
         cols = {r[1] for r in conn.execute("PRAGMA table_info(cli_events)")}
         assert "blocked" in cols
 
-    def test_repos_has_provider_column(self, db_path):
-        conn = db.ensure_db(db_path)
+    def test_repos_has_provider_column(self, conn):
         cols = {r[1] for r in conn.execute("PRAGMA table_info(repos)")}
         assert "provider" in cols
-        # Default value is 'github'
         conn.execute(
             "INSERT INTO repos (owner_repo, gh_account) VALUES ('test/repo', 'test')"
         )
         provider = conn.execute("SELECT provider FROM repos").fetchone()[0]
         assert provider == "github"
 
-    def test_ci_events_has_index(self, db_path):
-        conn = db.ensure_db(db_path)
+    def test_ci_events_has_index(self, conn):
         idx = conn.execute(
             "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_ci_lookup'"
         ).fetchone()
@@ -68,12 +68,10 @@ class TestSchema:
 
 
 class TestAdr:
-    def test_FR03_schema(self, db_path):
-        conn = db.ensure_db(db_path)
+    def test_FR03_schema(self, conn):
         cols = {r[1] for r in conn.execute("PRAGMA table_info(cli_events)")}
         assert cols >= {"id", "command", "args_json", "exit_code",
                         "duration_ms", "recorded_at"}
 
-    def test_FR05_wal_mode(self, db_path):
-        conn = db.ensure_db(db_path)
+    def test_FR05_wal_mode(self, conn):
         assert conn.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
