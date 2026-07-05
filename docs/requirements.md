@@ -212,14 +212,36 @@ def is_anomaly(execution_ms: int, ema_ms: float, threshold: float = 5.0) -> bool
 
 ## 6. Phase 6 — Extension Points (ATM / sc-mux)
 
-### Functional
+### 6.1 Shared Trigger Infrastructure
 
 | ID | Requirement |
 |---|---|
 | FR-49 | Trigger events emitted as structured log entries with action, level, and typed fields |
-| FR-50 | ATM adapter consumes trigger events and sends `atm send <agent> "CI: PR #42 — checks passed"` |
-| FR-51 | sc-mux dashboard reads continuity SQLite for CI status per registered repo/session |
 | FR-52 | Extension consumers have no dependency on continuity internals |
+
+### 6.2 ATM Notifications — see [requirements-atm.md](requirements-atm.md)
+
+The ATM module is a self-contained adapter that consumes trigger events
+and routes notifications to ATM team members. Full requirements including
+the notification routing matrix, fallback chain, identity model, and
+designated member mechanism are defined in the ATM-specific requirements
+document. Architectural decisions are recorded in
+[ADR 001](adr/001-atm-notifications.md).
+
+Key design points:
+- Module is a no-op when `ATM_TEAM` or `ATM_IDENTITY` is unset
+- Notifications route to the requesting member, falling back to a
+  designated member
+- Files causing merge conflicts are listed in unmergable notifications
+  (capped at 6, with total count)
+- `ci` is a permanent read-only team member; messages include the
+  requesting identity in the body
+
+### 6.3 sc-mux Dashboard
+
+| ID | Requirement |
+|---|---|
+| FR-51 | sc-mux dashboard reads continuity SQLite for CI status per registered repo/session |
 
 ### Non-Functional
 

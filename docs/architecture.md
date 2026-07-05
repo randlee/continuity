@@ -205,9 +205,41 @@ points for ATM messaging and dashboard notifications.
 
 ### 9.1 ATM Integration
 
-Trigger events are emitted as structured log entries. An ATM adapter
-consumes these and calls `atm send <agent> "CI: PR #42 — checks passed"`.
-Agents read their ATM inbox — they never poll GitHub directly.
+Trigger events are consumed by the ATM adapter module
+(`continuity/atm.py`). The module owns ATM CLI invocation, notification
+routing, and fallback logic. The rest of Continuity calls a narrow public
+interface — call sites never branch on ATM availability.
+
+**Identity model:** Continuity sends ATM messages as the `ci` team member
+(a permanent read-only member of the ATM team). The requesting identity
+(agent or human who triggered the event) is included in the message body:
+
+```
+From: ci (on behalf of rand)
+Subject: PR #42 unmergable — merge conflict in 3 files
+```
+
+**Notification routing** follows a single principle: whoever can fix the
+problem gets notified. If they can't be reached, the designated member
+(default: `team-lead`) handles it. Full routing matrix and fallback chain
+in [ADR 001](adr/001-atm-notifications.md).
+
+**Unmergable file lists:** notifications for merge conflicts include the
+conflicting file paths (≤6 displayed, total count always included). This
+is grounded in the GitHub merge API's 409 response body, which includes
+`files` with conflict details — no diff parsing needed.
+
+**Module no-op behavior:** if `ATM_TEAM` or `ATM_IDENTITY` is unset, every
+public call returns immediately. No stubs, no fallback message generation,
+no errors.
+
+**CLI surface:**
+```
+ci atm set-notify <member>    # pin designated member
+ci atm set-notify --reset     # restore team-lead default
+ci atm show-notify            # print current designated member
+ci atm status                 # validate ATM configuration
+```
 
 ### 9.2 sc-mux Dashboard
 
