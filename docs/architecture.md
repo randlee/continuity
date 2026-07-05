@@ -211,8 +211,9 @@ routing, and fallback logic. The rest of Continuity calls a narrow public
 interface — call sites never branch on ATM availability.
 
 **Identity model:** Continuity sends ATM messages as the `ci` team member
-(a permanent read-only member of the ATM team). The requesting identity
-(agent or human who triggered the event) is included in the message body:
+(a permanent member registered via `atm team member add`). The requesting
+identity (agent or human who triggered the event) is included in the
+message body:
 
 ```
 From: ci (on behalf of rand)
@@ -220,9 +221,16 @@ Subject: PR #42 unmergable — merge conflict in 3 files
 ```
 
 **Notification routing** follows a single principle: whoever can fix the
-problem gets notified. If they can't be reached, the designated member
-(default: `team-lead`) handles it. Full routing matrix and fallback chain
-in [ADR 001](adr/001-atm-notifications.md).
+problem gets notified. If they can't be reached, `team-lead` handles it.
+Agent-driven events (PR create, push) route to the requesting agent;
+daemon-detected events (CI completion, slow, timeout) and cascades always
+route to `team-lead`. Full routing matrix and fallback chain in
+[ADR 001](adr/001-atm-notifications.md).
+
+**Transient failures** (socket timeout, lock contention) retry 3× with
+exponential backoff (1s/2s/4s) before falling back. Permanent failures
+(member not in roster) fall back immediately. Notifications are sent in
+spawned tasks — retries never block the poll loop.
 
 **Unmergable file lists:** notifications for merge conflicts include the
 conflicting file paths (≤6 displayed, total count always included). This
@@ -231,13 +239,11 @@ is grounded in the GitHub merge API's 409 response body, which includes
 
 **Module no-op behavior:** if `ATM_TEAM` or `ATM_IDENTITY` is unset, every
 public call returns immediately. No stubs, no fallback message generation,
-no errors.
+no errors. `ATM_TEAM` is per-repo — set via environment variable, read at
+call time.
 
 **CLI surface:**
 ```
-ci atm set-notify <member>    # pin designated member
-ci atm set-notify --reset     # restore team-lead default
-ci atm show-notify            # print current designated member
 ci atm status                 # validate ATM configuration
 ```
 

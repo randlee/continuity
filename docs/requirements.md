@@ -230,12 +230,14 @@ document. Architectural decisions are recorded in
 
 Key design points:
 - Module is a no-op when `ATM_TEAM` or `ATM_IDENTITY` is unset
-- Notifications route to the requesting member, falling back to a
-  designated member
+- Notifications route to the requesting member, falling back to `team-lead`
+- CI completion, slow, and timeout events always route to `team-lead`
 - Files causing merge conflicts are listed in unmergable notifications
   (capped at 6, with total count)
-- `ci` is a permanent read-only team member; messages include the
-  requesting identity in the body
+- `ci` is a permanent team member registered via `atm team member add`;
+  messages include the requesting identity in the body
+- Transient ATM failures retry 3× with backoff; permanent failures fall
+  back immediately
 
 ### 6.3 sc-mux Dashboard
 

@@ -31,14 +31,17 @@ def atm_configured() -> bool:
     """True if ATM_TEAM and ATM_IDENTITY are both set."""
 
 def atm_send(to: str, subject: str, body: str) -> bool:
-    """Send to a team member. Returns False if member not in roster."""
-
-def atm_get_designated_member() -> str:
-    """Read .continuity.toml, default to 'team-lead'."""
+    """
+    Send to a team member within ATM_TEAM.
+    Returns False if member not in roster (permanent failure).
+    May raise transient failures (timeout, lock contention) — caller retries.
+    """
 
 def atm_notify(target: str | None, subject: str, body: str) -> bool:
     """
     Resolve target through the fallback chain and send.
+    target=None means route directly to designated member (team-lead).
+    Retries transient failures up to 3× with backoff.
     Returns True if message was delivered (to target or fallback).
     """
 ```
@@ -49,12 +52,16 @@ Continuity sends ATM messages **as** the read-only `ci` team member, but
 carries the requesting member's identity in the message body. This mirrors
 the `sudo` / `SUDO_USER` pattern.
 
+The `ci` member is registered in the ATM team via `atm team member add`
+(stored in ATM's SQLite database). It is a permanent member — never a
+runtime temporary member.
+
 | ID | Requirement |
 |---|---|
-| FR-ATM-04 | `ci` is a permanent read-only member of the ATM team (`.atm.toml`) |
+| FR-ATM-04 | `ci` is a permanent member of the ATM team, registered via `atm team member add` |
 | FR-ATM-05 | ATM messages are sent with `ATM_IDENTITY=ci` |
 | FR-ATM-06 | Message body includes the requesting identity: `From: ci (on behalf of <identity>)` |
-| FR-ATM-07 | `ATM_IDENTITY` env var carries the requesting member — set by the CLI caller or daemon context |
+| FR-ATM-07 | `ATM_IDENTITY` env var carries the requesting member — set by the CLI caller or captured from agent environment |
 
 **Identity sources for `ATM_IDENTITY`:**
 
@@ -63,59 +70,82 @@ the `sudo` / `SUDO_USER` pattern.
 | `ci pr check --atm-identity=<member>` | CLI flag |
 | Agent invokes `gh pr create` | Captured by interceptor from agent's `ATM_IDENTITY` env |
 | Agent invokes `git push` to PR branch | Captured by interceptor from agent's `ATM_IDENTITY` env |
-| Manual `git push` (human) | Not set → triggers designated-member fallback |
-| Daemon poll (automated) | Not set → triggers designated-member fallback |
+| Manual `git push` (human) | Not set → routes to designated member |
+| Daemon poll (automated) | Not set → routes to designated member |
 
 ## 3. Notification Routing
 
 ### 3.1 Routing Rules
 
 Notifications follow a single principle: **whoever can fix the problem gets
-notified. If they can't be reached, the designated member handles it.**
+notified. If they can't be reached, the designated member (`team-lead`)
+handles it.**
+
+Events the daemon detects independently (CI completion, slow/timeout)
+always route to `team-lead` — there is no requesting member in the poll
+path.
 
 | Trigger | Target | Fallback |
 |---|---|---|
-| PR created (unmergable) | `ATM_IDENTITY` (creator) | Designated member |
-| Commit pushed → PR becomes unmergable | `ATM_IDENTITY` (pusher) | Designated member |
-| PR-A merges → PR-B becomes unmergable | Designated member | — (terminal) |
-| `ATM_IDENTITY` not set (manual push, cron) | — | Designated member |
-| `ATM_IDENTITY` set but not in roster (`atm send` fails) | — | Designated member |
+| PR created (unmergable) | `ATM_IDENTITY` (creator) | `team-lead` |
+| Commit pushed → PR becomes unmergable | `ATM_IDENTITY` (pusher) | `team-lead` |
+| PR-A merges → PR-B becomes unmergable | `team-lead` | — (terminal) |
+| CI completed (success) | `team-lead` | — (terminal) |
+| CI completed (failure) | `team-lead` | — (terminal) |
+| CI slow (elapsed > 2× EMA) | `team-lead` | — (terminal) |
+| CI timeout (elapsed > max) | `team-lead` | — (terminal) |
+| `ATM_IDENTITY` not set (manual push, cron) | — | `team-lead` |
+| `ATM_IDENTITY` set but not in roster (`atm send` fails) | — | `team-lead` |
 
 | ID | Requirement |
 |---|---|
 | FR-ATM-08 | Notification target resolves through the matrix above — no ad-hoc routing at call sites |
 | FR-ATM-09 | When `ATM_IDENTITY` is set, attempt delivery to that member first |
-| FR-ATM-10 | When `atm send` fails (member not in roster), retry with designated member |
-| FR-ATM-11 | Cascade notifications (PR merges → other PRs become unmergable) always route to designated member |
-| FR-ATM-12 | Success notifications (PR merges, CI passes) route to the requesting member only |
+| FR-ATM-10 | When `atm send` fails with permanent error (not in roster), retry with `team-lead` |
+| FR-ATM-11 | Cascade notifications (PR merges → other PRs become unmergable) always route to `team-lead` |
+| FR-ATM-12 | CI completion, slow, and timeout events always route to `team-lead` |
 
-### 3.2 Edge Cases
+### 3.2 Transient Failure Handling
+
+ATM send can fail transiently (socket timeout, lock contention, `atm`
+process crash). These are retried before falling back.
+
+| ID | Requirement |
+|---|---|
+| FR-ATM-12a | Transient failures retry up to 3 times with exponential backoff (1s, 2s, 4s) |
+| FR-ATM-12b | After retries exhausted, fall back to `team-lead` |
+| FR-ATM-12c | Permanent failures (member not in roster) do not retry — fall back immediately |
+
+### 3.3 Edge Cases
 
 | Scenario | Behavior |
 |---|---|
-| `ATM_IDENTITY` is `ci` itself | Treat as unset — route to designated member |
-| Designated member is not in roster | Log error, skip notification (no infinite fallback) |
-| Multiple PRs become unmergable in same poll | Single message to designated member with summary |
+| `ATM_IDENTITY` is `ci` itself | Treat as unset — route to `team-lead` |
+| `team-lead` is not in roster | Log error, skip notification (terminal — no further fallback) |
+| Multiple PRs become unmergable in same poll cycle | Single batched message to the resolved target |
 | Trigger fires but ATM not configured | Silent no-op (FR-ATM-01) |
 
 | ID | Requirement |
 |---|---|
 | FR-ATM-13 | `ATM_IDENTITY=ci` is treated as unset (prevents self-send loops) |
-| FR-ATM-14 | If designated member is also not in roster, log error and skip — no recursive fallback |
-| FR-ATM-15 | Batch cascade notifications: one message for N PRs, not N messages |
+| FR-ATM-14 | If `team-lead` is also not in roster, log error and skip — no recursive fallback |
+| FR-ATM-15 | Batch notifications: when multiple events resolve to the same target in one poll cycle, send one message summarizing all |
 
 ## 4. Designated Member
 
-A single team member receives notifications when the requesting member
-cannot be identified or reached. Defaults to `team-lead`.
+The designated member is **always `team-lead`**. There is no per-repo
+configuration file and no persistence mechanism.
+
+`team-lead` resolves to the team leader for the ATM team identified by
+`ATM_TEAM`. For the `hermes` team, this is `hendrix`.
 
 | ID | Requirement |
 |---|---|
-| FR-ATM-16 | Default designated member is `team-lead` |
-| FR-ATM-17 | `ci atm set-notify <member>` pins a different designated member |
-| FR-ATM-18 | `ci atm set-notify --reset` restores the default (`team-lead`) |
-| FR-ATM-19 | Designated member is persisted in `.continuity.toml` at the repo root |
-| FR-ATM-20 | `ci atm show-notify` prints the current designated member |
+| FR-ATM-16 | Designated member is always `team-lead` — no configuration mechanism |
+
+*Future extension:* a `ci atm set-notify <member>` runtime override
+(in-memory only, resets on daemon restart) may be added if per-repo
+routing divergence becomes necessary. This is not part of v1.
 
 ## 5. Message Content
 
@@ -177,18 +207,18 @@ pr:
 |---|---|---|
 | PR created (unmergable) | `PR #N unmergable` | `PR #N (by <identity>) is unmergable — merge conflict in:\n  <file list>` |
 | Commit makes PR unmergable | `PR #N unmergable after push` | `PR #N (by <identity>) became unmergable after push <sha> — merge conflict in:\n  <file list>` |
-| PR-A merges → PR-B unmergable | `PR #N now unmergable` | `PR #<A> merged. PR #<B> (by <identity>) is now unmergable — merge conflict in:\n  <file list>` |
-| CI completed (success) | `PR #N CI passed` | `PR #N (by <identity>) — all checks passed` |
-| CI completed (failure) | `PR #N CI failed` | `PR #N (by <identity>) — <failed_job> failed` |
+| PR-A merges → PR-B unmergable | `PR #N now unmergable` | `PR #<A> merged. PR #<N> (by <identity>) is now unmergable — merge conflict in:\n  <file list>` |
+| CI completed (success) | `PR #N CI passed` | `PR #N — all checks passed` |
+| CI completed (failure) | `PR #N CI failed` | `PR #N — <failed_job> failed` |
+| CI slow | `PR #N CI slow` | `PR #N — <job> running for <elapsed>, 2× normal (<ema>)` |
+| CI timeout | `PR #N CI timeout` | `PR #N — <job> exceeded max duration (<max>), may be hung` |
+| Batch (N events, same target) | `PR status update` | Summary of all events in one message |
 
 ## 6. CLI Commands
 
 | Command | Description |
 |---|---|
-| `ci atm set-notify <member>` | Pin designated member |
-| `ci atm set-notify --reset` | Restore default (`team-lead`) |
-| `ci atm show-notify` | Print current designated member |
-| `ci atm status` | Check ATM configuration (env vars set, team exists, `ci` in roster) |
+| `ci atm status` | Check ATM configuration: `ATM_TEAM` and `ATM_IDENTITY` set, team exists, `ci` in roster |
 
 | ID | Requirement |
 |---|---|
@@ -199,8 +229,9 @@ pr:
 
 | ID | Requirement |
 |---|---|
-| NF-ATM-01 | ATM message delivery is fire-and-forget. Failed delivery does not block the poll loop |
-| NF-ATM-02 | ATM send timeout ≤ 5 seconds. On timeout, treat as delivery failure and fall back |
+| NF-ATM-01 | ATM message delivery is fire-and-forget after retries. Failed delivery does not block the poll loop |
+| NF-ATM-02 | ATM send timeout ≤ 5 seconds per attempt. On timeout, treat as transient failure |
 | NF-ATM-03 | ATM module has no import-time side effects — env vars checked at call time, not import time |
 | NF-ATM-04 | `atm` CLI is never invoked in the poll loop hot path for non-notification work |
 | NF-ATM-05 | Notification formatting is testable without an ATM installation |
+| NF-ATM-06 | Transient `atm send` failures retry 3× with exponential backoff (1s / 2s / 4s). Permanent failures (not in roster) are not retried |
