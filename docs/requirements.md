@@ -76,28 +76,91 @@ the CI/PR monitoring system for the Synaptic Canvas agent fleet.
 
 ## 4. Phase 4 — Polling Daemon
 
-### Functional
+Decomposed into independent modules, each testable in isolation.
+
+### 4.1 Module: `gh/client` — GitHub GraphQL REST Client
+
+Pure REST interface to GitHub's GraphQL API. No daemon logic, no SQLite, no
+polling. Testable with mocked HTTP responses.
 
 | ID | Requirement |
 |---|---|
-| FR-26 | Daemon polls GitHub via GraphQL. One query per `gh_account` per cycle, concurrent across accounts |
-| FR-27 | GraphQL query generated at runtime from `repos` table. Adding a repo requires no code change |
-| FR-28 | Daemon holds Bearer tokens in memory. Tokens obtained via `gh auth token` at startup. Refreshed on 401 |
-| FR-29 | State diffing compares incoming job states against latest `ci_events` per (repo, PR, job) |
-| FR-30 | Only changed jobs produce `ci_events` rows — no heartbeat entries |
-| FR-31 | Daemon operates in ACTIVE (30s), WATCHFUL (5m), IDLE (30m) modes |
-| FR-32 | Activity mode re-evaluated after each poll cycle |
-| FR-33 | SIGUSR1 wakes daemon for immediate unscheduled poll |
-| FR-34 | `post-push` hook sends SIGUSR1. Installed automatically by `continuity register` |
-| FR-35 | Every GraphQL response `rateLimit` block recorded in `api_usage` (cost, remaining, reset_at) |
-| FR-36 | If `remaining < LOW_WATER`, daemon increases poll interval regardless of activity mode |
-| FR-37 | Merge conflict detection: `mergeable = CONFLICTING` → `ci_event` + trigger |
-| FR-38 | CLI commands (`status`, `log`, `history`, `usage`) read SQLite only — no `gh` calls |
-| FR-39 | `continuity status` renders all open PRs with current job states and activity mode |
-| FR-40 | `continuity log <repo> <pr#>` shows chronological `ci_events` for a PR |
+| FR-26 | GraphQL query generated at runtime from `repos` table. One query per `gh_account` |
+| FR-27 | Responses parsed into typed `PollResult` (PRs + statusCheckRollup + rateLimit) |
+| FR-28 | Holds Bearer tokens in memory. Token via `gh auth token` at init. Refresh on 401 |
+| FR-35 | Every response `rateLimit` block extracted into `ApiUsage` struct |
+
+**Public API:**
+```python
+class GhClient:
+    def __init__(self, account: str): ...
+    def poll(self, repos: list[Repo]) -> PollResult: ...
+    @property
+    def rate_limit(self) -> ApiUsage: ...
+```
+
+### 4.2 Module: `diff` — State Diffing Engine
+
+Pure functions. No I/O, no side effects, no DB writes. Compares incoming
+data against current state.
+
+| ID | Requirement |
+|---|---|
+| FR-29 | `diff_jobs(incoming, current)` → `list[CiEvent]` — only changed jobs |
+| FR-30 | Identical poll results produce empty diff — no heartbeat entries |
+| FR-37 | `diff_conflicts(incoming, current)` → mergeability changes |
+
+**Public API:**
+```python
+def diff_jobs(incoming: list[JobState], current: dict[str, CiEvent]) -> list[CiEvent]: ...
+def diff_prs(incoming: list[PrSnapshot], current: dict[int, PrState]) -> PrDiff: ...
+```
+
+### 4.3 Module: `daemon` — Poll Loop + Lifecycle
+
+Orchestrates polling. Manages lifecycle, mode transitions, signal handlers.
+Depends on `gh/client`, `diff`, `db`. Testable with mocked `GhClient`.
+
+| ID | Requirement |
+|---|---|
+| FR-31 | ACTIVE (30s), WATCHFUL (5m), IDLE (30m) adaptive modes |
+| FR-32 | Mode re-evaluated after each poll cycle |
+| FR-33 | SIGUSR1 triggers immediate unscheduled poll |
+| FR-36 | If rate limit remaining < LOW_WATER, increase interval regardless of mode |
+| FR-43 | `continuity register` adds repo + installs post-push hook |
+
+**Singleton guarantees** (see Architecture §11):
+- PID file at `$CONTINUITY_HOME/daemon.pid`
+- Exclusive file lock at `$CONTINUITY_HOME/daemon.lock`
+- Second instance detects lock → reads PID → error if alive, clears if stale
+
+### 4.4 Module: `cli/daemon_cmd` — CLI Commands
+
+Read-only SQLite queries. No `gh` calls on the read path.
+
+| ID | Requirement |
+|---|---|
+| FR-38 | All CLI commands read SQLite only — no `gh` calls |
+| FR-39 | `continuity status` renders open PRs + job states + activity mode |
+| FR-40 | `continuity log <repo> <pr#>` shows chronological `ci_events` |
 | FR-41 | `continuity history <repo>` shows closed PRs with outcomes and durations |
 | FR-42 | `continuity usage` shows API point consumption per account |
-| FR-43 | `continuity register <owner/repo> --account <name>` adds repo + installs post-push hook |
+
+### 4.5 Module: `hooks` — Post-Push Hook
+
+| ID | Requirement |
+|---|---|
+| FR-34 | Installed automatically by `continuity register` |
+| FR-33 | Sends SIGUSR1 to daemon on `git push` to origin |
+
+### 4.6 Module: `poll` — Adaptive Interval Calculator
+
+Pure function. No I/O.
+
+| ID | Requirement |
+|---|---|
+| FR-31 | `next_interval(mode, rate_limit_remaining)` → seconds |
+| FR-36 | Rate limit backoff: double interval when remaining < LOW_WATER, up to cap |
 
 ### Non-Functional
 
