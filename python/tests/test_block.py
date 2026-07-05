@@ -14,6 +14,9 @@ from pathlib import Path
 
 import pytest
 
+# Ensure python/ is on sys.path so continuity-gh can import its submodules
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 _gh_path = str(Path(__file__).resolve().parent.parent / "continuity-gh")
 cg = importlib.machinery.SourceFileLoader("continuity_gh", _gh_path).load_module()
 
