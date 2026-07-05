@@ -172,6 +172,30 @@ Pure function. No I/O.
 | NF-14 | No subprocesses in the hot path (poll loop). Only `gh auth token` at startup |
 | NF-15 | Trigger callbacks fire in spawned tasks. Main poll loop is never blocked by a trigger |
 | NF-16 | SQLite in WAL mode. Daemon writes; CLI reads concurrently without blocking |
+
+## 5. Phase 5 — Resilience & Anomaly Detection
+
+### 5.1 Module: `monitor` — Job Duration Tracking
+
+Tracks queue time and execution time separately. Long queues are not
+anomalies — only abnormal execution times are.
+
+| ID | Requirement |
+|---|---|
+| FR-44 | `execution_time_ms(job)` = IN_PROGRESS → COMPLETED delta. Queue time tracked separately as QUEUED → IN_PROGRESS |
+| FR-45 | EMA of execution time per (repo, job_name). Recalculated on each COMPLETED event |
+| FR-46 | EMA of queue time per (repo, job_name). Informational only — does not trigger alerts |
+| FR-47 | Anomaly detection: execution_time > 5× ema_execution → "hung" event in `monitor_events` |
+| FR-48 | Stale detection: job in IN_PROGRESS for > 2× ema_execution without completing → "slow" event |
+| FR-49 | Backoff on transient failures: exponential with cap, retry limit per daemon config |
+
+**Public API (pure functions):**
+```python
+def calc_queue_time(events: list[CiEvent]) -> int | None: ...
+def calc_execution_time(events: list[CiEvent]) -> int | None: ...
+def update_ema(current_ema: float, new_value: int, alpha: float = 0.2) -> float: ...
+def is_anomaly(execution_ms: int, ema_ms: float, threshold: float = 5.0) -> bool: ...
+```
 | NF-17 | `CONTINUITY_DB` overrides database path for all components |
 
 ## 5. Phase 5 — Resilience (Slow/Timeout Detection + EMA)
