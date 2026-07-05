@@ -4,7 +4,6 @@ Tests FR-31, FR-32, FR-33, FR-36, singleton guard.
 All tests mock GhClient — no real GitHub access.
 """
 
-import fcntl
 import os
 import signal
 import sqlite3
@@ -66,7 +65,7 @@ class TestSingletonGuard:
         d._write_pid()
 
         assert d._pid_file.exists()
-        assert d._lock_file.exists()
+        assert d._lock_dir.exists()
         pid = int(d._pid_file.read_text().strip())
         assert pid == os.getpid()
 
@@ -91,9 +90,9 @@ class TestSingletonGuard:
         pid_file.parent.mkdir(exist_ok=True)
         pid_file.write_text("99999")  # nonexistent PID
 
-        # Create a lock file manually (no actual lock since process is gone)
-        lock_file = daemon_home / "daemon.lock"
-        lock_file.write_text("")
+        # Create a stale lock directory
+        lock_dir = daemon_home / "daemon.lock"
+        lock_dir.mkdir(exist_ok=True)
 
         d = Daemon(daemon_home, {"test": mock_client}, db_conn)
         d._acquire_lock()  # should succeed (stale lock cleared)

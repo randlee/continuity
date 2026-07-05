@@ -3,7 +3,8 @@
 Orchestrates polling: queries GitHub via GhClient, diffs results against
 DB, writes ci_events/pull_requests, manages adaptive mode transitions.
 
-Singleton: PID file + exclusive file lock. Testable with mocked GhClient.
+Singleton: PID file + lock directory (cross-platform, no fcntl).
+Testable with mocked GhClient.
 
 Public API:
     Daemon(home, gh_clients, db)
@@ -11,7 +12,6 @@ Public API:
     .shutdown()   — SIGTERM handler, release lock, flush
 """
 
-import fcntl
 import json
 import os
 import signal
@@ -64,11 +64,10 @@ class Daemon:
         self.db = db
         self.config = config or DaemonConfig()
         self.mode = ActivityMode.IDLE
-        self._lock_fd = None
+        self._lock_dir = self.home / "daemon.lock"
         self._shutdown_flag = False
         self._wake_event = False
         self._pid_file = self.home / "daemon.pid"
-        self._lock_file = self.home / "daemon.lock"
 
     # ── Lifecycle ────────────────────────────────────────────────────────
 
@@ -95,20 +94,21 @@ class Daemon:
     # ── Singleton guard ──────────────────────────────────────────────────
 
     def _acquire_lock(self):
-        """Acquire exclusive file lock. Fail if another daemon holds it."""
-        self._lock_fd = open(self._lock_file, "w")
+        """Acquire exclusive lock via lock directory (cross-platform).
+        os.mkdir is atomic — only one process can create the directory."""
         try:
-            fcntl.flock(self._lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
+            self._lock_dir.mkdir()
+        except FileExistsError:
             # Lock held — check if the holder is alive
             pid = self._read_pid()
             if pid and _is_pid_alive(pid):
                 raise RuntimeError(
                     f"Daemon already running (PID {pid}). "
-                    f"Lock file: {self._lock_file}"
+                    f"Lock dir: {self._lock_dir}"
                 )
-            # Stale lock — take it
-            fcntl.flock(self._lock_fd, fcntl.LOCK_EX)
+            # Stale lock — remove and retry
+            self._lock_dir.rmdir()
+            self._lock_dir.mkdir()
 
     def _write_pid(self):
         """Write current PID to pid file."""
@@ -123,12 +123,10 @@ class Daemon:
 
     def _cleanup(self):
         """Release lock, remove PID file."""
-        if self._lock_fd:
-            try:
-                fcntl.flock(self._lock_fd, fcntl.LOCK_UN)
-                self._lock_fd.close()
-            except Exception:
-                pass
+        try:
+            self._lock_dir.rmdir()
+        except (FileNotFoundError, OSError):
+            pass
         self._pid_file.unlink(missing_ok=True)
 
     # ── Signal handling ──────────────────────────────────────────────────
