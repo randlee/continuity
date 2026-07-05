@@ -26,6 +26,7 @@ SCHEMA = """
         id              INTEGER PRIMARY KEY,
         owner_repo      TEXT    UNIQUE NOT NULL,
         gh_account      TEXT    NOT NULL,
+        provider        TEXT    DEFAULT 'github',
         last_synced     INTEGER,
         avg_ci_duration INTEGER,
         max_ci_duration INTEGER

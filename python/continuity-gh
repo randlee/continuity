@@ -49,6 +49,23 @@ DB_PATH = _data_dir() / "continuity.db"
 import subprocess as _subprocess
 
 
+def _detect_provider() -> str:
+    """Detect git hosting provider from remote URL. Returns 'github' or 'azure'."""
+    try:
+        proc = _subprocess.run(
+            ["git", "remote", "get-url", "origin"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if proc.returncode != 0:
+            return "github"
+        url = proc.stdout.strip().lower()
+        if "dev.azure.com" in url or "visualstudio.com" in url:
+            return "azure"
+        return "github"
+    except Exception:
+        return "github"
+
+
 def _detect_repo(real_gh: str) -> str:
     """Detect current repo as owner/repo via gh CLI."""
     try:
@@ -74,9 +91,10 @@ def _ensure_repo(db, owner_repo: str) -> None:
     if existing:
         return
     owner = owner_repo.split("/")[0] if "/" in owner_repo else owner_repo
+    provider = _detect_provider()
     db.execute(
-        "INSERT INTO repos (owner_repo, gh_account) VALUES (?, ?)",
-        (owner_repo, owner),
+        "INSERT INTO repos (owner_repo, gh_account, provider) VALUES (?, ?, ?)",
+        (owner_repo, owner, provider),
     )
 
 
@@ -122,6 +140,24 @@ def intercept(command: str, args: list[str], real_binary: str,
         db.close()
         sys.stderr.write(block_msg)
         return 1
+
+    # Provider guard: block gh commands on Azure repos
+    if command == "gh":
+        provider = _detect_provider()
+        if provider == "azure":
+            db.execute(
+                "INSERT INTO cli_events "
+                "(command, args_json, exit_code, duration_ms, blocked, recorded_at) "
+                "VALUES (?, ?, -1, 0, 2, ?)",
+                (command, json.dumps(args), now),
+            )
+            db.commit()
+            db.close()
+            sys.stderr.write(
+                "continuity: this repo uses Azure DevOps. Use 'az' CLI instead of 'gh'.\n"
+                "Azure DevOps support is not yet implemented.\n"
+            )
+            return 1
 
     # Phase 1: delegate + log
     start = time.time()

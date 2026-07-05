@@ -48,6 +48,17 @@ class TestSchema:
         cols = {r[1] for r in conn.execute("PRAGMA table_info(cli_events)")}
         assert "blocked" in cols
 
+    def test_repos_has_provider_column(self, db_path):
+        conn = db.ensure_db(db_path)
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(repos)")}
+        assert "provider" in cols
+        # Default value is 'github'
+        conn.execute(
+            "INSERT INTO repos (owner_repo, gh_account) VALUES ('test/repo', 'test')"
+        )
+        provider = conn.execute("SELECT provider FROM repos").fetchone()[0]
+        assert provider == "github"
+
     def test_ci_events_has_index(self, db_path):
         conn = db.ensure_db(db_path)
         idx = conn.execute(
