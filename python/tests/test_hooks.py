@@ -29,7 +29,11 @@ class TestInstall:
 
     def test_hook_is_executable(self, repo):
         path = install(repo)
-        assert path.stat().st_mode & stat.S_IEXEC
+        if sys.platform == "win32":
+            # Windows doesn't use POSIX execute bits
+            assert path.exists()
+        else:
+            assert path.stat().st_mode & stat.S_IEXEC
 
     def test_hook_contains_continuity(self, repo):
         path = install(repo)
