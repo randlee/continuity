@@ -30,7 +30,7 @@ from httpd import DaemonHandler, STALE_THRESHOLD_SECONDS
 @pytest.fixture
 def db_path():
     """Temp SQLite DB with schema and test data."""
-    with tempfile.TemporaryDirectory() as td:
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
         p = Path(td) / "test.db"
         conn = _db.ensure_db(p)
         now = int(time.time())
