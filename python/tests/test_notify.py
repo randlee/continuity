@@ -224,6 +224,20 @@ def test_resolve_push_identity_no_atm_identity(conn):
     assert ident is None
 
 
+def test_resolve_push_identity_malformed_json(conn):
+    """Returns None when args_json is malformed."""
+    import json
+    now = int(time.time())
+    conn.execute(
+        "INSERT INTO cli_events (command, args_json, exit_code, duration_ms, recorded_at) "
+        "VALUES ('git-push', 'not-valid-json', 0, 0, ?)",
+        (now,),
+    )
+    conn.commit()
+    ident = resolve_push_identity(conn, "owner/repo")
+    assert ident is None
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Dispatch
 # ═══════════════════════════════════════════════════════════════════════════

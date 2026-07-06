@@ -166,6 +166,22 @@ def test_conflict_files_custom_max():
     assert "(1 more)" in result
 
 
+def test_conflict_files_max_display_one():
+    """max_display=1 shows one file plus count."""
+    result = _atm.format_conflict_files(
+        ["a.rs", "b.rs", "c.rs"],
+        max_display=1,
+    )
+    assert result == "  a.rs\n  (2 more)"
+
+
+def test_conflict_files_max_display_one_single():
+    """max_display=1 with single file, no count."""
+    result = _atm.format_conflict_files(["a.rs"], max_display=1)
+    assert result == "  a.rs"
+    assert "more" not in result
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # format_notification
 # ═══════════════════════════════════════════════════════════════════════════
@@ -474,6 +490,31 @@ def test_notify_no_double_fallback(conn, mock_atm_binary, monkeypatch):
     )
     assert result is False
     assert calls == ["team-lead"]
+
+
+def test_notify_requested_by_matches_designated_no_double_send(conn, mock_atm_binary, monkeypatch):
+    """When requested_by equals designated member, sends once (no fallback loop)."""
+    calls = []
+
+    def _fake_run(*a, **kw):
+        to = a[0][2]
+        calls.append(to)
+        return _mock_run(1, "not a member")
+
+    monkeypatch.setattr(_atm.subprocess, "run", _fake_run)
+    # requested_by="rand", but designated member on this repo is also "rand"
+    conn.execute(
+        "UPDATE repos SET designated_member = 'rand' WHERE owner_repo = 'owner/repo'"
+    )
+    conn.commit()
+
+    result = _atm.atm_notify(
+        conn, "owner/repo", "rand", [("s", "b")],
+    )
+    assert result is False  # both fail
+    assert calls == ["rand", "team-lead"], (
+        f"Expected ['rand', 'team-lead'], got {calls}"
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════════

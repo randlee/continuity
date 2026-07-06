@@ -20,7 +20,7 @@ sys_path.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import db as _db
 from daemon import Daemon, DaemonConfig, ActivityMode, _is_pid_alive
 from gh.client import GhClient, PollResult, PrSnapshot, CheckRun, ApiUsage
-from notify import CiSlow, CiTimeout
+from notify import CiSlow, CiTimeout, CiCompleted
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -637,3 +637,128 @@ class TestMonitorIntegration:
 
         # Dedup should be cleared
         assert len(d._notified_monitor) == 0
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Daemon internal helpers
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestDaemonHelpers:
+    def test_sleep_interruptible_wakes_at_scheduled_time(self, daemon_home, db_conn, mock_client):
+        """_sleep_interruptible returns early when scheduled wake time arrives."""
+        d = Daemon(daemon_home, {"test": mock_client}, db_conn)
+        d._wake_event = True
+        d._scheduled_wake_at = time.time() + 0.05  # 50ms from now
+
+        start = time.time()
+        d._sleep_interruptible(10.0)  # 10s sleep, should wake at 50ms
+        elapsed = time.time() - start
+        assert elapsed < 1.0, f"Sleep took {elapsed}s, should wake at ~0.05s"
+
+    def test_sleep_interruptible_ignores_past_wake(self, daemon_home, db_conn, mock_client):
+        """_sleep_interruptible ignores stale wake time in the past."""
+        d = Daemon(daemon_home, {"test": mock_client}, db_conn)
+        d._wake_event = True
+        d._scheduled_wake_at = time.time() - 60  # 60s ago — already passed
+
+        start = time.time()
+        d._sleep_interruptible(0.1)  # short sleep, should wake on deadline
+        elapsed = time.time() - start
+        assert elapsed < 1.0, f"Sleep took {elapsed}s, should return quickly"
+
+    def test_sleep_interruptible_no_wake_sleeps_full(self, daemon_home, db_conn, mock_client):
+        """_sleep_interruptible sleeps full duration when no wake scheduled."""
+        d = Daemon(daemon_home, {"test": mock_client}, db_conn)
+        d._wake_event = False
+
+        start = time.time()
+        d._sleep_interruptible(0.1)  # 100ms
+        elapsed = time.time() - start
+        assert elapsed >= 0.08, f"Sleep took only {elapsed}s, should sleep ~0.1s"
+
+    def test_min_rate_limit_remaining_no_clients(self, daemon_home, db_conn):
+        """Returns 5000 when no clients are configured."""
+        d = Daemon(daemon_home, {}, db_conn)
+        assert d._min_rate_limit_remaining() == 5000
+
+    def test_min_rate_limit_remaining_min_across_clients(self, daemon_home, db_conn):
+        """Returns the minimum across all clients."""
+        c1 = MagicMock(spec=GhClient)
+        c1.rate_limit = ApiUsage(remaining=200)
+        c2 = MagicMock(spec=GhClient)
+        c2.rate_limit = ApiUsage(remaining=50)
+        d = Daemon(daemon_home, {"a": c1, "b": c2}, db_conn)
+        assert d._min_rate_limit_remaining() == 50
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# _add_ci_completion
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestAddCiCompletion:
+    def test_emits_when_all_jobs_terminal(self, daemon_home, db_conn):
+        """Emits CiCompleted when all jobs are COMPLETED with SUCCESS."""
+        now = 1000
+        db_conn.execute(
+            "INSERT INTO ci_events (owner_repo, pr_number, job_name, status, conclusion, recorded_at) "
+            "VALUES ('o/r', 1, 'build', 'COMPLETED', 'SUCCESS', ?)", (now,)
+        )
+        db_conn.execute(
+            "INSERT INTO ci_events (owner_repo, pr_number, job_name, status, conclusion, recorded_at) "
+            "VALUES ('o/r', 1, 'test', 'COMPLETED', 'SUCCESS', ?)", (now,)
+        )
+        db_conn.commit()
+
+        c = MagicMock(spec=GhClient)
+        d = Daemon(daemon_home, {"test": c}, db_conn)
+        events: list = []
+        from daemon import _add_ci_completion
+        _add_ci_completion(events, "o/r", 1, db_conn, {})
+
+        assert len(events) == 1
+        assert isinstance(events[0], CiCompleted)
+        assert events[0].conclusion == "SUCCESS"
+
+    def test_no_emit_when_jobs_still_running(self, daemon_home, db_conn):
+        """Does not emit when some jobs are still IN_PROGRESS."""
+        now = 1000
+        db_conn.execute(
+            "INSERT INTO ci_events (owner_repo, pr_number, job_name, status, conclusion, recorded_at) "
+            "VALUES ('o/r', 1, 'build', 'COMPLETED', 'SUCCESS', ?)", (now,)
+        )
+        db_conn.execute(
+            "INSERT INTO ci_events (owner_repo, pr_number, job_name, status, conclusion, recorded_at) "
+            "VALUES ('o/r', 1, 'test', 'IN_PROGRESS', NULL, ?)", (now,)
+        )
+        db_conn.commit()
+
+        c = MagicMock(spec=GhClient)
+        d = Daemon(daemon_home, {"test": c}, db_conn)
+        events: list = []
+        from daemon import _add_ci_completion
+        _add_ci_completion(events, "o/r", 1, db_conn, {})
+
+        assert events == []  # not all terminal
+
+    def test_emits_failure_with_failed_jobs(self, daemon_home, db_conn):
+        """Emits CiCompleted with FAILURE and lists failed jobs."""
+        now = 1000
+        db_conn.execute(
+            "INSERT INTO ci_events (owner_repo, pr_number, job_name, status, conclusion, recorded_at) "
+            "VALUES ('o/r', 1, 'build', 'COMPLETED', 'FAILURE', ?)", (now,)
+        )
+        db_conn.execute(
+            "INSERT INTO ci_events (owner_repo, pr_number, job_name, status, conclusion, recorded_at) "
+            "VALUES ('o/r', 1, 'test', 'COMPLETED', 'SUCCESS', ?)", (now,)
+        )
+        db_conn.commit()
+
+        c = MagicMock(spec=GhClient)
+        d = Daemon(daemon_home, {"test": c}, db_conn)
+        events: list = []
+        from daemon import _add_ci_completion
+        _add_ci_completion(events, "o/r", 1, db_conn, {})
+
+        assert len(events) == 1
+        assert events[0].conclusion == "FAILURE"
+        assert events[0].failed_jobs == ["build"]
