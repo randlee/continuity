@@ -20,7 +20,7 @@ sys_path.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import db as _db
 from daemon import Daemon, DaemonConfig, ActivityMode, _is_pid_alive
 from gh.client import GhClient, PollResult, PrSnapshot, CheckRun, ApiUsage
-from notify import CiSlow, CiTimeout, CiCompleted
+from notify import CiCompleted
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -472,7 +472,7 @@ class TestPostPushDelay:
 # ═══════════════════════════════════════════════════════════════════════════
 
 class TestMonitorIntegration:
-    """Tests for _update_ema and _check_monitor."""
+    """Tests for _update_ema (EMA tracking still active)."""
 
     def _seed_ci_events(self, conn, owner_repo: str, pr_number: int,
                         job_name: str, timestamps: list[tuple[str, str | None, int]]):
@@ -525,118 +525,6 @@ class TestMonitorIntegration:
         d._update_ema("o/r", "test", now)
         assert d._ema[("o/r", "test")] == pytest.approx(120.0)
         assert d._ema_count[("o/r", "test")] == 2
-
-    def test_ema_requires_min_samples(self, daemon_home, db_conn):
-        """check_monitor skips when fewer than MIN_SAMPLES runs completed."""
-        now = 1000
-        self._seed_ci_events(db_conn, "o/r", 1, "build", [
-            ("QUEUED", None, 100),
-            ("IN_PROGRESS", None, 110),
-            ("IN_PROGRESS", None, 200),  # latest is IN_PROGRESS
-        ])
-        db_conn.commit()
-
-        c = MagicMock(spec=GhClient)
-        d = Daemon(daemon_home, {"test": c}, db_conn)
-        # No EMA data yet — count is 0
-        events = d._check_monitor(now)
-        assert events == []
-
-    def test_check_monitor_slow(self, daemon_home, db_conn):
-        """Emits CiSlow when elapsed > 2× EMA."""
-        now = 5000
-
-        # Seed EMA: 3 runs at 100s each → EMA ≈ 100
-        for i in range(3):
-            self._seed_ci_events(db_conn, "o/r", 1, "build", [
-                ("IN_PROGRESS", None, i * 500 + 100),
-                ("COMPLETED", "SUCCESS", i * 500 + 200),
-            ])
-        # Current run IN_PROGRESS at t=4600, now=5000 → 400s elapsed
-        self._seed_ci_events(db_conn, "o/r", 1, "build", [
-            ("IN_PROGRESS", None, 4600),
-        ])
-        db_conn.commit()
-
-        c = MagicMock(spec=GhClient)
-        d = Daemon(daemon_home, {"test": c}, db_conn)
-
-        # Feed EMA data
-        d._ema[("o/r", "build")] = 100.0
-        d._ema_count[("o/r", "build")] = 3
-
-        events = d._check_monitor(now)
-        assert len(events) == 1
-        assert isinstance(events[0], CiSlow)
-        assert events[0].pr_number == 1
-        assert events[0].job_name == "build"
-        assert events[0].elapsed_seconds == 400
-
-    def test_check_monitor_hung(self, daemon_home, db_conn):
-        """Emits CiTimeout when elapsed > 5× EMA."""
-        now = 1000
-        self._seed_ci_events(db_conn, "o/r", 1, "build", [
-            ("IN_PROGRESS", None, 400),  # started at 400, now 1000 → 600s
-        ])
-        db_conn.commit()
-
-        c = MagicMock(spec=GhClient)
-        d = Daemon(daemon_home, {"test": c}, db_conn)
-        d._ema[("o/r", "build")] = 100.0
-        d._ema_count[("o/r", "build")] = 3
-
-        events = d._check_monitor(now)
-        assert len(events) == 1
-        assert isinstance(events[0], CiTimeout)
-
-    def test_check_monitor_dedup(self, daemon_home, db_conn):
-        """Does not re-emit slow/timeout for same (repo, pr, job, type)."""
-        now = 1000
-        self._seed_ci_events(db_conn, "o/r", 1, "build", [
-            ("IN_PROGRESS", None, 600),
-        ])
-        db_conn.commit()
-
-        c = MagicMock(spec=GhClient)
-        d = Daemon(daemon_home, {"test": c}, db_conn)
-        d._ema[("o/r", "build")] = 100.0
-        d._ema_count[("o/r", "build")] = 3
-
-        # First call emits
-        events1 = d._check_monitor(now)
-        assert len(events1) == 1
-
-        # Second call on same data does not re-emit
-        events2 = d._check_monitor(now)
-        assert events2 == []
-
-    def test_check_monitor_clears_dedup_on_new_run(self, daemon_home, db_conn):
-        """Dedup entries cleared when new run starts (EMA updated)."""
-        now = 1000
-        self._seed_ci_events(db_conn, "o/r", 1, "build", [
-            ("IN_PROGRESS", None, 600),
-        ])
-        db_conn.commit()
-
-        c = MagicMock(spec=GhClient)
-        d = Daemon(daemon_home, {"test": c}, db_conn)
-        d._ema[("o/r", "build")] = 100.0
-        d._ema_count[("o/r", "build")] = 3
-
-        # Emit slow
-        d._check_monitor(now)
-        assert len(d._notified_monitor) == 1
-
-        # Update EMA (new run completed)
-        self._seed_ci_events(db_conn, "o/r", 1, "build", [
-            ("IN_PROGRESS", None, 700),
-            ("COMPLETED", "SUCCESS", 800),
-        ])
-        db_conn.commit()
-        d._update_ema("o/r", "build", now)
-
-        # Dedup should be cleared
-        assert len(d._notified_monitor) == 0
 
 
 # ═══════════════════════════════════════════════════════════════════════════
