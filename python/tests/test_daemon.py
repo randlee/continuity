@@ -380,6 +380,94 @@ class TestAdr:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# POST_PUSH_DELAY + mode transition edge cases (to be fixed)
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestPostPushDelay:
+    """Tests for POST_PUSH_DELAY behavior and mode transitions."""
+
+    def test_wake_sets_pr_changed_mode(self, daemon_home, db_conn, mock_client):
+        """GAP: _wake should immediately set mode to PR_CHANGED."""
+        d = Daemon(daemon_home, {"test": mock_client}, db_conn)
+        assert d.mode == ActivityMode.INACTIVE
+
+        d._wake()
+        assert d.mode == ActivityMode.PR_CHANGED, (
+            "_wake should set mode to PR_CHANGED immediately"
+        )
+        assert d._wake_event is True
+        assert d._scheduled_wake_at > 0
+
+    def test_first_wins_multiple_wakes(self, daemon_home, db_conn, mock_client):
+        """GAP: first SIGUSR1 wins; subsequent signals within delay window ignored."""
+        d = Daemon(daemon_home, {"test": mock_client}, db_conn)
+        d._wake()
+        first_scheduled = d._scheduled_wake_at
+
+        # Second wake within window → ignored
+        d._wake()
+        assert d._scheduled_wake_at == first_scheduled, (
+            "first-wins: second wake should not change scheduled time"
+        )
+
+    def test_pr_changed_persists_while_unknown(self, daemon_home, db_conn, mock_client):
+        """PR_CHANGED stays active as long as mergeable remains UNKNOWN."""
+        db_conn.execute(
+            "INSERT INTO pull_requests (owner_repo, pr_number, branch, state, mergeable, updated_at) "
+            "VALUES ('x/y', 1, 'feat', 'OPEN', 'UNKNOWN', 0)"
+        )
+        db_conn.commit()
+
+        d = Daemon(daemon_home, {"test": mock_client}, db_conn)
+        d._recalculate_mode()
+        assert d.mode == ActivityMode.PR_CHANGED
+
+        # After another poll cycle with same data, should still be PR_CHANGED
+        d._recalculate_mode()
+        assert d.mode == ActivityMode.PR_CHANGED, (
+            "PR_CHANGED should persist while mergeable is UNKNOWN"
+        )
+
+    def test_pr_changed_transitions_to_active_when_mergeable_computed(self, daemon_home, db_conn, mock_client):
+        """PR_CHANGED → ACTIVE when mergeable changes from UNKNOWN to MERGEABLE."""
+        db_conn.execute(
+            "INSERT INTO pull_requests (owner_repo, pr_number, branch, state, mergeable, updated_at) "
+            "VALUES ('x/y', 1, 'feat', 'OPEN', 'UNKNOWN', 0)"
+        )
+        db_conn.execute(
+            "INSERT INTO ci_events (owner_repo, pr_number, job_name, status, recorded_at) "
+            "VALUES ('x/y', 1, 'build', 'IN_PROGRESS', 0)"
+        )
+        db_conn.commit()
+
+        d = Daemon(daemon_home, {"test": mock_client}, db_conn)
+        d._recalculate_mode()
+        assert d.mode == ActivityMode.PR_CHANGED  # UNKNOWN takes priority
+
+        # Mergeable computed → now ACTIVE (CI still running)
+        db_conn.execute(
+            "UPDATE pull_requests SET mergeable = 'MERGEABLE' WHERE pr_number = 1"
+        )
+        db_conn.commit()
+        d._recalculate_mode()
+        assert d.mode == ActivityMode.ACTIVE, (
+            "Should transition to ACTIVE when mergeable is no longer UNKNOWN and CI running"
+        )
+
+    def test_recalculate_mode_overridden_by_pending_wake(self, daemon_home, db_conn, mock_client):
+        """GAP: If _wake_event is set, _recalculate_mode should honor it."""
+        d = Daemon(daemon_home, {"test": mock_client}, db_conn)
+        d._wake()  # sets mode to PR_CHANGED, schedules wake
+
+        # Simulate what happens after a poll: _recalculate_mode sees no UNKNOWN, no CI
+        # and would set INACTIVE — but a wake was requested during the poll
+        d._recalculate_mode()
+        assert d.mode == ActivityMode.PR_CHANGED, (
+            "Pending wake should keep mode at PR_CHANGED after recalculation"
+        )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # Monitor integration tests — EMA, slow/timeout detection
 # ═══════════════════════════════════════════════════════════════════════════
 

@@ -31,7 +31,7 @@ from notify import (
 )
 from constants import (
     STATUS_COMPLETED, STATUS_QUEUED, STATUS_IN_PROGRESS,
-    MERGEABLE_CONFLICTING,
+    MERGEABLE_CONFLICTING, MERGEABLE_UNKNOWN,
     PR_STATE_OPEN, PR_STATE_MERGED, PR_STATE_CLOSED,
     CONCLUSION_SUCCESS, CONCLUSION_FAILURE,
     TERMINAL_STATUSES, ACTIVE_STATUSES,
@@ -108,7 +108,7 @@ class Daemon:
         self._shutdown_flag = True
 
     def _wake(self, signum=None, frame=None):
-        """SIGUSR1 handler. Schedules delayed poll for PR_CHANGED inspection.
+        """SIGUSR1 handler. Immediately enters PR_CHANGED mode.
 
         ADR-20: POST_PUSH_DELAY = 1 min. GitHub takes ~1 min to compute
         is_mergeable after a push. The first SIGUSR1 sets the wake time;
@@ -119,6 +119,7 @@ class Daemon:
             return  # first-wins: already scheduled, ignore
         self._scheduled_wake_at = now + self.config.post_push_delay
         self._wake_event = True
+        self.mode = ActivityMode.PR_CHANGED
 
     # ── Singleton guard ──────────────────────────────────────────────────
 
@@ -514,7 +515,16 @@ class Daemon:
         PR_CHANGED: any PR has mergeable=UNKNOWN (still computing after push)
         ACTIVE: any CI job QUEUED or IN_PROGRESS
         INACTIVE: neither condition
+
+        If a SIGUSR1 wake is pending, PR_CHANGED is preserved regardless
+        of other conditions (prevents race: wake scheduled during poll,
+        then overwritten by stale recalculation).
         """
+        # If a wake is pending, keep PR_CHANGED
+        if self._wake_event:
+            self.mode = ActivityMode.PR_CHANGED
+            return
+
         # Check for active CI
         rows = self.db.execute(
             "SELECT status FROM ci_events "
@@ -527,7 +537,8 @@ class Daemon:
         # Check for UNKNOWN mergeable states (post-push, still computing)
         unknown_count = self.db.execute(
             "SELECT COUNT(*) FROM pull_requests "
-            "WHERE mergeable = 'UNKNOWN' AND state = 'OPEN'"
+            "WHERE mergeable = ? AND state = ?",
+            (MERGEABLE_UNKNOWN, PR_STATE_OPEN),
         ).fetchone()[0]
 
         if unknown_count > 0:

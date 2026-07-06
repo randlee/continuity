@@ -20,7 +20,7 @@ from pathlib import Path
 from constants import (
     STATUS_QUEUED, STATUS_IN_PROGRESS, STATUS_COMPLETED,
     CONCLUSION_SUCCESS, CONCLUSION_FAILURE,
-    PR_STATE_OPEN,
+    PR_STATE_OPEN, MERGEABLE_UNKNOWN,
     ACTIVE_STATUSES,
 )
 
@@ -112,7 +112,8 @@ def _activity_mode(db: sqlite3.Connection) -> str:
 
     unknown_count = db.execute(
         "SELECT COUNT(*) FROM pull_requests "
-        "WHERE mergeable = 'UNKNOWN' AND state = 'OPEN'"
+        "WHERE mergeable = ? AND state = ?",
+        (MERGEABLE_UNKNOWN, PR_STATE_OPEN),
     ).fetchone()[0]
     if unknown_count > 0:
         return "PR_CHANGED"
