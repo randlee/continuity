@@ -196,18 +196,28 @@ class TestCmdLog:
 # ═══════════════════════════════════════════════════════════════════════════
 
 class TestCmdHistory:
-    def test_shows_merged_prs(self, conn):
-        _seed_data(conn)
-        output = cmd_history("owner/repo", db=conn)
+    def test_shows_merged_prs(self):
+        data = {
+            "prs": [
+                {"owner_repo": "owner/repo", "pr_number": 3,
+                 "branch": "old/z", "state": "MERGED"},
+            ],
+        }
+        with _mock_get_response(data):
+            output = cmd_history("owner/repo")
         assert "owner/repo" in output
         assert "old/z" in output
 
-    def test_no_closed_prs(self, conn):
-        _seed_data(conn)
-        conn.execute("DELETE FROM pull_requests WHERE state = 'MERGED'")
-        conn.commit()
-        output = cmd_history("owner/repo", db=conn)
+    def test_no_closed_prs(self):
+        with _mock_get_response({"prs": []}):
+            output = cmd_history("owner/repo")
         assert "No closed PRs" in output
+
+    def test_handles_daemon_error(self):
+        from cli.http_client import DaemonError
+        with mock.patch("cli.daemon_cmd.get", side_effect=DaemonError("daemon down")):
+            output = cmd_history("owner/repo")
+        assert "Error: daemon down" in output
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -336,12 +346,17 @@ class TestAdr:
         assert "build" in output
         assert "QUEUED" in output
 
-    def test_FR41_history(self, conn):
-        """FR-41: ci history shows closed PRs."""
-        _seed_data(conn)
-        output = cmd_history("owner/repo", db=conn)
+    def test_FR41_history(self):
+        """FR-41: ci history shows closed PRs via HTTP RPC."""
+        data = {
+            "prs": [
+                {"owner_repo": "owner/repo", "pr_number": 3,
+                 "branch": "old/z", "state": "MERGED"},
+            ],
+        }
+        with _mock_get_response(data):
+            output = cmd_history("owner/repo")
         assert "closed PRs" in output
-        assert "old/z" in output
 
     def test_FR43_register(self, conn):
         """FR-43: ci register adds repo."""

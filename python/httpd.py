@@ -28,6 +28,7 @@ import time
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from threading import Thread
+from urllib.parse import urlparse, parse_qs
 
 from constants import (
     PR_STATE_OPEN,
@@ -104,12 +105,21 @@ class DaemonHandler(BaseHTTPRequestHandler):
         d = self.daemon_ref
         now = int(time.time())
 
+        # Parse query params: ?closed=true&repo=owner/repo
+        parsed = urlparse(self.path)
+        params = parse_qs(parsed.query)
+        show_closed = params.get("closed", ["false"])[0] == "true"
+        repo_filter = params.get("repo", [None])[0]
+
         refreshed = True
-        if self._data_is_stale(now):
+        if self._data_is_stale(now) and not show_closed:
             ok, err = self._refresh_data(d, now)
             refreshed = ok
 
-        prs = self._query_prs()
+        if show_closed:
+            prs = self._query_closed_prs(repo_filter)
+        else:
+            prs = self._query_prs(repo_filter)
         response = {
             "prs": prs,
             "mode": d.mode.value,
@@ -215,14 +225,22 @@ class DaemonHandler(BaseHTTPRequestHandler):
 
     # ── Queries (own SQLite connection, thread-safe reads via WAL) ──────
 
-    def _query_prs(self) -> list[dict]:
-        """Return all open PRs with current CI job states."""
+    def _query_prs(self, repo_filter: str | None = None) -> list[dict]:
+        """Return all open PRs with current CI job states, optionally filtered by repo."""
         prs = []
-        rows = self.db_conn.execute(
-            "SELECT owner_repo, pr_number, branch, mergeable, state "
-            "FROM pull_requests WHERE state = ? ORDER BY owner_repo, pr_number",
-            (PR_STATE_OPEN,),
-        ).fetchall()
+        if repo_filter:
+            rows = self.db_conn.execute(
+                "SELECT owner_repo, pr_number, branch, mergeable, state "
+                "FROM pull_requests WHERE state = ? AND owner_repo = ? "
+                "ORDER BY owner_repo, pr_number",
+                (PR_STATE_OPEN, repo_filter),
+            ).fetchall()
+        else:
+            rows = self.db_conn.execute(
+                "SELECT owner_repo, pr_number, branch, mergeable, state "
+                "FROM pull_requests WHERE state = ? ORDER BY owner_repo, pr_number",
+                (PR_STATE_OPEN,),
+            ).fetchall()
 
         for owner_repo, pr_num, branch, mergeable, state in rows:
             jobs = self.db_conn.execute(
@@ -242,6 +260,34 @@ class DaemonHandler(BaseHTTPRequestHandler):
                     {"name": j[0], "status": j[1], "conclusion": j[2]}
                     for j in jobs
                 ],
+            })
+        return prs
+
+    def _query_closed_prs(self, repo_filter: str | None = None) -> list[dict]:
+        """Return closed/merged PRs, optionally filtered by repo."""
+        prs = []
+        if repo_filter:
+            rows = self.db_conn.execute(
+                "SELECT owner_repo, pr_number, branch, mergeable, state "
+                "FROM pull_requests WHERE state IN ('CLOSED', 'MERGED') "
+                "AND owner_repo = ? ORDER BY pr_number DESC LIMIT 50",
+                (repo_filter,),
+            ).fetchall()
+        else:
+            rows = self.db_conn.execute(
+                "SELECT owner_repo, pr_number, branch, mergeable, state "
+                "FROM pull_requests WHERE state IN ('CLOSED', 'MERGED') "
+                "ORDER BY pr_number DESC LIMIT 50",
+            ).fetchall()
+
+        for owner_repo, pr_num, branch, mergeable, state in rows:
+            prs.append({
+                "owner_repo": owner_repo,
+                "pr_number": pr_num,
+                "branch": branch,
+                "mergeable": mergeable,
+                "state": state,
+                "jobs": [],
             })
         return prs
 

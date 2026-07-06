@@ -136,15 +136,28 @@ def cmd_log(owner_repo: str, pr_number: int) -> str:
 # ci history <repo> (FR-41)
 # ═══════════════════════════════════════════════════════════════════════════
 
-def cmd_history(owner_repo: str, limit: int = 20,
-                db: sqlite3.Connection | None = None) -> str:
-    """Show closed PRs with outcomes and durations."""
-    if db is not None:
-        return _cmd_history_from_db(db, owner_repo, limit)
+def cmd_history(owner_repo: str, limit: int = 20) -> str:
+    """Show closed PRs with outcomes via HTTP RPC."""
     try:
-        return _cmd_history_from_path(owner_repo, limit)
-    except DaemonError:
-        return _cmd_history_from_path(owner_repo, limit)
+        data = get(f"/prs?closed=true&repo={owner_repo}")
+    except DaemonError as e:
+        return f"Error: {e}\n"
+
+    if data.get("status") != "ok":
+        return f"Error: {data.get('error', 'unknown error')}\n"
+
+    prs = data.get("prs", [])
+    if not prs:
+        return f"No closed PRs for {owner_repo}\n"
+
+    lines = [f"{owner_repo} — closed PRs"]
+    lines.append("-" * 70)
+    lines.append(f"{'PR':>5} {'branch':<25} {'state':>8}")
+
+    for pr in prs:
+        lines.append(f"{pr['pr_number']:>5} {pr.get('branch', ''):<25} {pr.get('state', ''):>8}")
+
+    return "\n".join(lines) + "\n"
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -293,46 +306,6 @@ def cmd_atm_status() -> str:
     lines.append("")
     lines.append("Status: READY")
     return "\n".join(lines) + "\n"
-
-
-# ── SQLite fallback for ci history (used until httpd adds closed PRs endpoint)
-
-
-def _cmd_history_from_db(db: sqlite3.Connection, owner_repo: str, limit: int = 20) -> str:
-    """Direct SQLite history query using provided connection."""
-    prs = db.execute(
-        "SELECT pr_number, branch, state FROM pull_requests "
-        "WHERE owner_repo = ? AND state IN ('CLOSED', 'MERGED') "
-        "ORDER BY pr_number DESC LIMIT ?",
-        (owner_repo, limit),
-    ).fetchall()
-
-    if not prs:
-        return f"No closed PRs for {owner_repo}\n"
-
-    lines = [f"{owner_repo} — closed PRs"]
-    lines.append("-" * 70)
-    lines.append(f"{'PR':>5} {'branch':<25} {'state':>8}")
-
-    for pr_num, branch, state in prs:
-        lines.append(f"{pr_num:>5} {branch:<25} {state:>8}")
-
-    return "\n".join(lines) + "\n"
-
-
-def _cmd_history_from_path(owner_repo: str, limit: int = 20) -> str:
-    """SQLite history query using filesystem DB path (fallback when daemon down)."""
-    import db as _db
-    continuity_home = os.environ.get("CONTINUITY_HOME", "")
-    if continuity_home:
-        db_path = Path(continuity_home) / "continuity.db"
-    else:
-        db_path = Path.home() / ".local" / "share" / "continuity" / "continuity.db"
-    conn = _db.ensure_db(db_path)
-    try:
-        return _cmd_history_from_db(conn, owner_repo, limit)
-    finally:
-        conn.close()
 
 
 def _format_ts(unix_ts: int) -> str:
