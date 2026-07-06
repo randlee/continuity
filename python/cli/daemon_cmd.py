@@ -140,13 +140,11 @@ def cmd_history(owner_repo: str, limit: int = 20,
                 db: sqlite3.Connection | None = None) -> str:
     """Show closed PRs with outcomes and durations."""
     if db is not None:
-        return _cmd_history_sqlite_db(db, owner_repo, limit)
+        return _cmd_history_from_db(db, owner_repo, limit)
     try:
-        # Note: closed PRs endpoint not yet implemented in httpd.
-        # For now, fall back to SQLite for history until httpd adds it.
-        return _cmd_history_sqlite(owner_repo, limit)
+        return _cmd_history_from_path(owner_repo, limit)
     except DaemonError:
-        return _cmd_history_sqlite(owner_repo, limit)
+        return _cmd_history_from_path(owner_repo, limit)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -297,24 +295,11 @@ def cmd_atm_status() -> str:
     return "\n".join(lines) + "\n"
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# OBSOLETE: SQLite-based commands — preserved for reference during migration.
-# Remove after Sprint 1 verification.
-# ═══════════════════════════════════════════════════════════════════════════
-
-# OBSOLETE: replaced by HTTP RPC — remove after Sprint 1 verified
-def _cmd_status_sqlite(db: sqlite3.Connection) -> str:
-    """[OBSOLETE] Direct SQLite status query."""
-    repos = db.execute("SELECT owner_repo FROM repos ORDER BY owner_repo").fetchall()
-    if not repos:
-        return "No repos registered. Use 'ci register <owner/repo>'.\n"
-    # ... (original implementation preserved but not shown — use git history)
-    return "Status via SQLite (OBSOLETE — use HTTP RPC)\n"
+# ── SQLite fallback for ci history (used until httpd adds closed PRs endpoint)
 
 
-# OBSOLETE: replaced by HTTP RPC — remove after Sprint 1 verified
-def _cmd_history_sqlite_db(db: sqlite3.Connection, owner_repo: str, limit: int = 20) -> str:
-    """[OBSOLETE] Direct SQLite history query using provided connection."""
+def _cmd_history_from_db(db: sqlite3.Connection, owner_repo: str, limit: int = 20) -> str:
+    """Direct SQLite history query using provided connection."""
     prs = db.execute(
         "SELECT pr_number, branch, state FROM pull_requests "
         "WHERE owner_repo = ? AND state IN ('CLOSED', 'MERGED') "
@@ -335,10 +320,8 @@ def _cmd_history_sqlite_db(db: sqlite3.Connection, owner_repo: str, limit: int =
     return "\n".join(lines) + "\n"
 
 
-# OBSOLETE: replaced by HTTP RPC — remove after Sprint 1 verified
-def _cmd_history_sqlite(owner_repo: str, limit: int = 20) -> str:
-    """[OBSOLETE] Direct SQLite history query — used as fallback until
-    httpd implements closed PRs endpoint."""
+def _cmd_history_from_path(owner_repo: str, limit: int = 20) -> str:
+    """SQLite history query using filesystem DB path (fallback when daemon down)."""
     import db as _db
     continuity_home = os.environ.get("CONTINUITY_HOME", "")
     if continuity_home:
@@ -347,29 +330,11 @@ def _cmd_history_sqlite(owner_repo: str, limit: int = 20) -> str:
         db_path = Path.home() / ".local" / "share" / "continuity" / "continuity.db"
     conn = _db.ensure_db(db_path)
     try:
-        prs = conn.execute(
-            "SELECT pr_number, branch, state FROM pull_requests "
-            "WHERE owner_repo = ? AND state IN ('CLOSED', 'MERGED') "
-            "ORDER BY pr_number DESC LIMIT ?",
-            (owner_repo, limit),
-        ).fetchall()
-
-        if not prs:
-            return f"No closed PRs for {owner_repo}\n"
-
-        lines = [f"{owner_repo} — closed PRs"]
-        lines.append("-" * 70)
-        lines.append(f"{'PR':>5} {'branch':<25} {'state':>8}")
-
-        for pr_num, branch, state in prs:
-            lines.append(f"{pr_num:>5} {branch:<25} {state:>8}")
-
-        return "\n".join(lines) + "\n"
+        return _cmd_history_from_db(conn, owner_repo, limit)
     finally:
         conn.close()
 
 
-# OBSOLETE: replaced by HTTP RPC — remove after Sprint 1 verified
 def _format_ts(unix_ts: int) -> str:
     """Format unix timestamp for display."""
     if not unix_ts:

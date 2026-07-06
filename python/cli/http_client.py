@@ -15,6 +15,8 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+from constants import DEFAULT_PORT
+
 
 def _data_dir() -> Path:
     """Platform-appropriate data directory (same as interceptor)."""
@@ -40,7 +42,7 @@ def _read_port() -> int:
         return int(port_file.read_text().strip())
     except (FileNotFoundError, ValueError):
         # Fallback: try default port for compatibility
-        return 9119
+        return DEFAULT_PORT
 
 
 def daemon_url(endpoint: str) -> str:
