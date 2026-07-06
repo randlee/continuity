@@ -17,6 +17,7 @@ import os
 import signal
 import sqlite3
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from enum import Enum
@@ -88,6 +89,7 @@ class Daemon:
         self._ema_count: dict[tuple[str, str], int] = {}
         # Dedup: prevent duplicate slow/timeout notifications per CI run
         self._notified_monitor: set[tuple[str, int, str, str]] = set()
+        self._poll_lock = threading.Lock()
         self._httpd = None
 
     # ── Lifecycle ────────────────────────────────────────────────────────
@@ -101,7 +103,11 @@ class Daemon:
 
         # Start HTTP server for CLI RPC
         from httpd import start_httpd
-        self._httpd = start_httpd(self)
+        db_path = Path(os.environ.get(
+            "CONTINUITY_DB",
+            str(Path.home() / ".local" / "share" / "continuity" / "continuity.db"),
+        ))
+        self._httpd = start_httpd(self, db_path)
 
         try:
             self._run_loop()
