@@ -56,6 +56,9 @@ class DaemonHandler(BaseHTTPRequestHandler):
         if self.daemon_ref is None:
             self._json_error(503, "daemon not ready")
             return
+        if self.db_conn is None:
+            self._json_error(503, "database not ready")
+            return
 
         path = self.path.rstrip("/")
 
@@ -67,6 +70,9 @@ class DaemonHandler(BaseHTTPRequestHandler):
             self._handle_prs()
         elif path.startswith("/prs/") and path.count("/") == 4:
             parts = path.split("/")
+            if not parts[2] or not parts[3]:
+                self._json_error(400, "invalid owner/repo in URL")
+                return
             self._handle_pr_detail(parts[2], parts[3], parts[4])
         else:
             self._json_error(404, "not found")
@@ -91,7 +97,7 @@ class DaemonHandler(BaseHTTPRequestHandler):
             "rate_limit_remaining": d._min_rate_limit_remaining(),
             "repos_tracked": self._count_repos(),
             "last_synced": last_synced,
-            "stale_seconds": (int(time.time()) - last_synced) if last_synced else None,
+            "stale_seconds": max(0, int(time.time()) - last_synced) if last_synced else None,
         })
 
     def _handle_prs(self):
@@ -125,16 +131,19 @@ class DaemonHandler(BaseHTTPRequestHandler):
         owner_repo = f"{owner}/{repo}"
         now = int(time.time())
 
+        refreshed = True
         if self._data_is_stale_for_repo(owner_repo, now):
             ok, err = self._refresh_data(d, now)
-            if not ok:
-                self._json_error(504, f"poll timed out, returning stale data: {err}")
+            refreshed = ok
 
         pr = self._query_pr_detail(owner_repo, pr_num)
         if pr is None:
             self._json_error(404, f"PR {owner_repo}#{pr_num} not found")
             return
 
+        pr["refreshed"] = refreshed
+        if not refreshed:
+            pr["warning"] = "data may be stale — poll timed out"
         self._json_ok(pr)
 
     def _handle_poll(self):

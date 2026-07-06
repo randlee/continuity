@@ -190,7 +190,8 @@ class Daemon:
 
             self._wake_event = False
             self._scheduled_wake_at = 0.0
-            self._poll_cycle()
+            with self._poll_lock:
+                self._poll_cycle()
             self._recalculate_mode()
 
 
@@ -310,7 +311,7 @@ class Daemon:
                 self.db.execute(
                     "UPDATE pull_requests SET state=?, mergeable=?, updated_at=? "
                     "WHERE owner_repo=? AND pr_number=?",
-                    (pr.state, pr.mergeable or "UNKNOWN", now, owner_repo, pr.number),
+                    (pr.state, pr.mergeable or MERGEABLE_UNKNOWN, now, owner_repo, pr.number),
                 )
 
                 # Detect PR merged (for cascade later)
@@ -331,9 +332,9 @@ class Daemon:
 
             for pr in pr_diff.closed:
                 self.db.execute(
-                    "UPDATE pull_requests SET state='CLOSED', updated_at=? "
+                    "UPDATE pull_requests SET state = ? , updated_at=? "
                     "WHERE owner_repo=? AND pr_number=?",
-                    (now, owner_repo, pr.number),
+                    (PR_STATE_CLOSED, now, owner_repo, pr.number),
                 )
 
             # Conflict detection (FR-37): new conflicts

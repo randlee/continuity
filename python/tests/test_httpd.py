@@ -294,8 +294,8 @@ def test_refresh_data_poll_failure(db_path):
     assert ok is False
     assert "API down" in err
 
-def test_prs_serves_stale_on_refresh_timeout(db_path):
-    """When poll times out, returns PRs with warning flag."""
+def test_pr_detail_serves_stale_on_refresh_timeout(db_path):
+    """When poll times out, returns PR with warning flag."""
     old_time = int(time.time()) - STALE_THRESHOLD_SECONDS - 10
     conn = sqlite3.connect(str(db_path))
     conn.execute("UPDATE repos SET last_synced = ?", (old_time,))
@@ -304,14 +304,80 @@ def test_prs_serves_stale_on_refresh_timeout(db_path):
 
     h = _make_handler(db_path)
     h.daemon_ref._poll_lock.acquire.return_value = False
-    h.path = "/prs"
+    h.path = "/prs/o/r/1"
     h.do_GET()
     data = _get_json(h)
     assert data["status"] == "ok"
     assert data["refreshed"] is False
     assert "warning" in data
     assert "stale" in data["warning"]
-    assert len(data["prs"]) == 1
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# URL validation
+# ═══════════════════════════════════════════════════════════════════════════
+
+def test_pr_detail_rejects_empty_owner(db_path):
+    """Empty owner in URL returns 400."""
+    h = _make_handler(db_path)
+    h.path = "/prs//r/1"
+    h.do_GET()
+    data = _get_json(h)
+    assert data["status"] == "error"
+    assert "invalid" in data["error"].lower()
+
+def test_pr_detail_rejects_empty_repo(db_path):
+    """Empty repo in URL returns 400."""
+    h = _make_handler(db_path)
+    h.path = "/prs/o//1"
+    h.do_GET()
+    data = _get_json(h)
+    assert data["status"] == "error"
+    assert "invalid" in data["error"].lower()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Negative stale_seconds
+# ═══════════════════════════════════════════════════════════════════════════
+
+def test_stale_seconds_never_negative(db_path):
+    """stale_seconds clamped to 0 when last_synced is in the future."""
+    future_time = int(time.time()) + 3600
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("UPDATE repos SET last_synced = ?", (future_time,))
+    conn.commit()
+    conn.close()
+
+    h = _make_handler(db_path)
+    h.path = "/status"
+    h.do_GET()
+    data = _get_json(h)
+    assert data["stale_seconds"] == 0
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# db_conn null guard
+# ═══════════════════════════════════════════════════════════════════════════
+
+def test_handler_rejects_when_db_conn_none(db_path):
+    """Returns 503 when db_conn is None."""
+    daemon = mock.MagicMock()
+    daemon.mode = mock.MagicMock()
+    daemon.mode.value = "INACTIVE"
+
+    h = DaemonHandler.__new__(DaemonHandler)
+    h.daemon_ref = daemon
+    h.db_conn = None
+    h.wfile = mock.MagicMock()
+    h.send_response = mock.MagicMock()
+    h.send_header = mock.MagicMock()
+    h.end_headers = mock.MagicMock()
+    h.path = "/status"
+
+    h.do_GET()
+    data = _get_json(h)
+    assert data["status"] == "error"
+    assert "database" in data["error"]
 
 
 # ═══════════════════════════════════════════════════════════════════════════
