@@ -1,5 +1,6 @@
 """gh pr create parser — extracts PR number, branch, repo from output URL."""
 
+import os
 import re
 import sqlite3
 import time
@@ -20,9 +21,10 @@ def parse(db: sqlite3.Connection, args: list[str], stdout: str,
             branch = args[i + 1]
             break
     now = int(time.time())
+    requested_by = os.environ.get("ATM_IDENTITY")
     db.execute(
         "INSERT OR REPLACE INTO pull_requests "
-        "(owner_repo, pr_number, branch, state, updated_at) "
-        "VALUES (?, ?, ?, 'OPEN', ?)",
-        (owner_repo, pr_num, branch or "unknown", now),
+        "(owner_repo, pr_number, branch, state, requested_by, updated_at) "
+        "VALUES (?, ?, ?, 'OPEN', ?, ?)",
+        (owner_repo, pr_num, branch or "unknown", requested_by, now),
     )

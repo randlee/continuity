@@ -42,6 +42,7 @@ SCHEMA = """
         head_sha    TEXT,
         mergeable   TEXT,
         state       TEXT,
+        requested_by TEXT,
         updated_at  INTEGER,
         UNIQUE(owner_repo, pr_number)
     );
@@ -89,3 +90,8 @@ def _run_migrations(db: sqlite3.Connection) -> None:
     cols = [row[1] for row in db.execute("PRAGMA table_info(repos)").fetchall()]
     if "designated_member" not in cols:
         db.execute("ALTER TABLE repos ADD COLUMN designated_member TEXT")
+
+    # Migration 002: add requested_by column to pull_requests
+    pr_cols = [row[1] for row in db.execute("PRAGMA table_info(pull_requests)").fetchall()]
+    if "requested_by" not in pr_cols:
+        db.execute("ALTER TABLE pull_requests ADD COLUMN requested_by TEXT")
