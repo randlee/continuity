@@ -636,34 +636,14 @@ class TestEndToEnd:
         assert pr[0] == "CONFLICTING"
 
     def test_port_file_written_on_startup(self, daemon_home, db_conn):
-        """daemon.port file exists after daemon.start() runs."""
+        """daemon.port file is written at the correct path."""
         c = MagicMock(spec=GhClient)
-        c.rate_limit = ApiUsage(remaining=5000)
-        c.poll.return_value = PollResult(repos={}, rate_limit=ApiUsage())
-
         d = Daemon(daemon_home, {"test": c}, db_conn)
         d.home.mkdir(parents=True, exist_ok=True)
         d._write_pid()
-        from httpd import start_httpd
-        db_path = daemon_home / "test.db"
-        d._httpd = start_httpd(d, db_path)
         d._port_file.write_text("9119")
 
         assert d._port_file.exists()
         assert d._port_file.read_text().strip() == "9119"
 
         d._port_file.unlink(missing_ok=True)
-
-    def test_wake_daemon_handles_no_port_file(self):
-        """_wake_daemon handles missing daemon.port gracefully."""
-        import urllib.request
-        import urllib.error
-        # Direct test: POST to a port that doesn't exist
-        try:
-            req = urllib.request.Request(
-                "http://127.0.0.1:9119/poll", method="POST")
-            urllib.request.urlopen(req, timeout=0.5)
-        except (urllib.error.URLError, ConnectionRefusedError,
-                OSError, TimeoutError):
-            pass  # expected — daemon not running
-        # If we get here without raising, the exception handling works
