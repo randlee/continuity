@@ -88,6 +88,7 @@ class Daemon:
         self._ema_count: dict[tuple[str, str], int] = {}
         # Dedup: prevent duplicate slow/timeout notifications per CI run
         self._notified_monitor: set[tuple[str, int, str, str]] = set()
+        self._httpd = None
 
     # ── Lifecycle ────────────────────────────────────────────────────────
 
@@ -97,6 +98,10 @@ class Daemon:
         self._acquire_lock()
         self._write_pid()
         self._setup_signals()
+
+        # Start HTTP server for CLI RPC
+        from httpd import start_httpd
+        self._httpd = start_httpd(self)
 
         try:
             self._run_loop()
@@ -333,6 +338,12 @@ class Daemon:
                     "VALUES (?, ?, 'merge', 'COMPLETED', 'CONFLICT', ?)",
                     (repo_name, pr_num, now),
                 )
+
+            # Update last_synced timestamp for cache freshness
+            self.db.execute(
+                "UPDATE repos SET last_synced = ? WHERE owner_repo = ?",
+                (now, owner_repo),
+            )
 
             # Cascade detection: merged PRs may have caused other PRs to conflict
             if merged_prs:
