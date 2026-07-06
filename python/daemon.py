@@ -289,9 +289,11 @@ class Daemon:
             pr_diff = diff_prs(prs, current_prs)
             for pr in pr_diff.added:
                 self.db.execute(
-                    "INSERT OR REPLACE INTO pull_requests (owner_repo, pr_number, branch, state, updated_at) "
-                    "VALUES (?, ?, ?, ?, ?)",
-                    (owner_repo, pr.number, "", pr.state, now),
+                    "INSERT OR REPLACE INTO pull_requests "
+                    "(owner_repo, pr_number, branch, state, mergeable, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (owner_repo, pr.number, "",
+                     pr.state, pr.mergeable or MERGEABLE_UNKNOWN, now),
                 )
                 # New PR: check if unmergable
                 if pr.mergeable == MERGEABLE_CONFLICTING:
