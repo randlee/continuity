@@ -24,7 +24,6 @@ class PollConfig:
     pr_changed_interval: int = 30
     active_interval: int = 300           # 5 min (ADR-21)
     inactive_interval: int = 1200         # 20 min
-    post_push_delay: int = 60             # 1 min (ADR-20)
     low_water: int = 1000                 # rate limit remaining threshold
     max_backoff: int = 3600               # max backoff (1 hour)
     backoff_multiplier: float = 2.0

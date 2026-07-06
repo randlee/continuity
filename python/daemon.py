@@ -255,6 +255,9 @@ class Daemon:
                 "rate limit baseline: cost=%d remaining=%d reset=%s",
                 rl.cost, rl.remaining, rl.reset_at,
             )
+        else:
+            logger.debug("poll cost: %d points, remaining: %d",
+                         rl.cost, rl.remaining)
 
         for owner_repo, prs in result.repos.items():
             # Build current state for diffing

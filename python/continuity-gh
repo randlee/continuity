@@ -15,6 +15,7 @@ import json
 import os
 import sys
 import time
+import urllib.request
 from pathlib import Path
 
 # Ensure the install directory is on sys.path so sibling modules resolve.
@@ -128,6 +129,21 @@ def _ensure_repo_fn(db):
         _ensure_repo(db, owner_repo)
     return fn
 
+def _wake_daemon():
+    """POST /poll to daemon to enter PR_CHANGED for new PR.
+    Fire-and-forget — daemon may not be running."""
+    try:
+        port_file = _data_dir() / "daemon.port"
+        port = int(port_file.read_text().strip())
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{port}/poll",
+            method="POST",
+        )
+        urllib.request.urlopen(req, timeout=2)
+    except Exception:
+        pass  # daemon may not be running — no error, no crash
+
+
 def intercept(command: str, args: list[str], real_binary: str,
               db_path: Path, timeout: int = 300) -> int:
     """Core interception logic. Three phases in order:
@@ -190,6 +206,10 @@ def intercept(command: str, args: list[str], real_binary: str,
             git.parse(args, db)
     except Exception:
         pass
+
+    # Wake daemon on PR create so new PR enters PR_CHANGED immediately
+    if command == "gh" and len(args) >= 2 and args[0] == "pr" and args[1] == "create":
+        _wake_daemon()
 
     db.commit()
     db.close()

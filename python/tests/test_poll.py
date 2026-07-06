@@ -95,10 +95,6 @@ class TestAdr:
         assert next_interval(ActivityMode.ACTIVE, 5000) == 300
         assert next_interval(ActivityMode.INACTIVE, 5000) == 1200
 
-    def test_FR31b_post_push_delay(self):
-        """FR-31b: PollConfig has 60s post_push_delay."""
-        assert PollConfig().post_push_delay == 60
-
     def test_FR36_backoff(self):
         """FR-36: Rate limit backoff when < LOW_WATER."""
         normal = next_interval(ActivityMode.ACTIVE, 5000)
