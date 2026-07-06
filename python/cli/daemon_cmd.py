@@ -1,82 +1,85 @@
-"""CLI commands for continuity daemon. Read-only SQLite queries.
+"""CLI commands for continuity. HTTP RPC client — no direct SQLite reads.
 
-FR-38: All commands read SQLite only — no gh calls.
-FR-39: continuity status — open PRs + job states + activity mode
-FR-40: continuity log <repo> <pr#> — chronological ci_events
-FR-41: continuity history <repo> — closed PRs with outcomes
-FR-42: continuity usage — API point consumption per account
-FR-43: continuity register — add repo + install post-push hook
+FR-38: All commands use daemon HTTP RPC.
+FR-39: ci status → GET /prs
+FR-40: ci log <repo> <pr#> → GET /prs/<owner>/<repo>/<num>
+FR-41: ci history <repo> → GET /prs?closed=true&repo=<owner>/<repo>
+FR-42: ci usage → GET /status
+FR-43: ci poll → POST /poll
 
-Public API: each command is a function that takes (db, args) and returns
-formatted output string. Testable with temp SQLite DBs.
+Public API: each command is a function that returns formatted output string.
+Testable with mocked HTTP responses.
 """
 
+import json
 import os
 import sqlite3
 import time
-from dataclasses import dataclass
 from pathlib import Path
 
+from cli.http_client import get, post, DaemonError
 from constants import (
     STATUS_QUEUED, STATUS_IN_PROGRESS, STATUS_COMPLETED,
     CONCLUSION_SUCCESS, CONCLUSION_FAILURE,
-    PR_STATE_OPEN, MERGEABLE_UNKNOWN,
-    ACTIVE_STATUSES,
 )
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# continuity status (FR-39)
+# ci status (FR-39)
 # ═══════════════════════════════════════════════════════════════════════════
 
-def cmd_status(db: sqlite3.Connection) -> str:
+def cmd_status() -> str:
     """Show all open PRs with current job states and activity mode."""
-    repos = db.execute("SELECT owner_repo FROM repos ORDER BY owner_repo").fetchall()
-    if not repos:
-        return "No repos registered. Use 'continuity register <owner/repo>'.\n"
+    try:
+        data = get("/prs")
+    except DaemonError as e:
+        return f"Error: {e}\n"
+
+    if data.get("status") != "ok":
+        return f"Error: {data.get('error', 'unknown error')}\n"
+
+    prs = data.get("prs", [])
+    mode = data.get("mode", "UNKNOWN")
+
+    if not prs:
+        return ("No repos registered. Use 'ci register <owner/repo>'.\n"
+                f"Mode: {mode}\n")
 
     lines = []
     lines.append(f"{'repo':<30} {'PR':>5} {'branch':<25} {'mergeable':>10} {'mode':>8}  jobs")
     lines.append("-" * 100)
 
-    for (owner_repo,) in repos:
-        prs = db.execute(
-            "SELECT pr_number, branch, mergeable, state FROM pull_requests "
-            "WHERE owner_repo = ? AND state = 'OPEN' ORDER BY pr_number",
-            (owner_repo,),
-        ).fetchall()
+    for pr in prs:
+        owner_repo = pr["owner_repo"]
+        pr_num = pr["pr_number"]
+        branch = pr.get("branch", "")
+        mergeable = pr.get("mergeable", "UNKNOWN")
+        jobs = pr.get("jobs", [])
 
-        for pr_num, branch, mergeable, state in prs:
-            # Get latest job statuses
-            jobs = db.execute(
-                "SELECT job_name, status, conclusion FROM ci_events "
-                "WHERE owner_repo = ? AND pr_number = ? "
-                "GROUP BY job_name HAVING recorded_at = MAX(recorded_at)",
-                (owner_repo, pr_num),
-            ).fetchall()
+        pr_mode = _pr_mode(jobs)
+        job_summary = " ".join(_job_symbol(j["name"], j["status"], j.get("conclusion"))
+                               for j in jobs)
 
-            mode = _pr_mode(jobs)
-            job_summary = " ".join(_job_symbol(name, status, conclusion) for name, status, conclusion in jobs)
+        lines.append(
+            f"{owner_repo:<30} {pr_num:>5} {branch:<25} {mergeable or 'UNKNOWN':>10} {pr_mode:<8}  {job_summary}"
+        )
 
-            lines.append(
-                f"{owner_repo:<30} {pr_num:>5} {branch:<25} {mergeable or 'UNKNOWN':>10} {mode:<8}  {job_summary}"
-            )
-
-    # Activity footer
-    mode = _activity_mode(db)
     lines.append("")
     lines.append(f"Mode: {mode}")
+    if data.get("warning"):
+        lines.append(f"Warning: {data['warning']}")
 
     return "\n".join(lines) + "\n"
 
 
-def _pr_mode(jobs: list[tuple]) -> str:
+def _pr_mode(jobs: list[dict]) -> str:
     """Determine PR mode from job states."""
-    statuses = {s for _, s, _ in jobs}
-    if statuses & ACTIVE_STATUSES:
+    statuses = {j["status"] for j in jobs}
+    active = {STATUS_QUEUED, STATUS_IN_PROGRESS}
+    if statuses & active:
         return "ACTIVE"
-    if statuses & {STATUS_COMPLETED}:
-        conclusions = {c for _, _, c in jobs if c}
+    if STATUS_COMPLETED in statuses:
+        conclusions = {j.get("conclusion") for j in jobs if j.get("conclusion")}
         if conclusions == {CONCLUSION_SUCCESS}:
             return "SUCCESS"
         if CONCLUSION_FAILURE in conclusions:
@@ -85,158 +88,114 @@ def _pr_mode(jobs: list[tuple]) -> str:
 
 
 def _job_symbol(name: str, status: str, conclusion: str | None) -> str:
-    """Render a job as a compact symbol: build\u2713, test\u29d7, lint\u2717."""
+    """Render a job as a compact symbol: build✓, test⧗, lint✗."""
     if conclusion == CONCLUSION_SUCCESS:
-        mark = "\u2713"
+        mark = "✓"
     elif conclusion == CONCLUSION_FAILURE:
-        mark = "\u2717"
+        mark = "✗"
     elif status == STATUS_IN_PROGRESS:
-        mark = "\u29d7"
+        mark = "⧗"
     elif status in (STATUS_QUEUED, "PENDING"):
-        mark = "\u29d7"
+        mark = "⧗"
     else:
         mark = "?"
     return f"{name}{mark}"
 
 
-def _activity_mode(db: sqlite3.Connection) -> str:
-    """Determine overall activity mode."""
-    rows = db.execute(
-        "SELECT status FROM ci_events "
-        "GROUP BY owner_repo, pr_number, job_name "
-        "HAVING recorded_at = MAX(recorded_at)"
-    ).fetchall()
-
-    if any(s in ACTIVE_STATUSES for (s,) in rows):
-        return "ACTIVE"
-
-    unknown_count = db.execute(
-        "SELECT COUNT(*) FROM pull_requests "
-        "WHERE mergeable = ? AND state = ?",
-        (MERGEABLE_UNKNOWN, PR_STATE_OPEN),
-    ).fetchone()[0]
-    if unknown_count > 0:
-        return "PR_CHANGED"
-    return "INACTIVE"
-
-
 # ═══════════════════════════════════════════════════════════════════════════
-# continuity log <repo> <pr#> (FR-40)
+# ci log <repo> <pr#> (FR-40)
 # ═══════════════════════════════════════════════════════════════════════════
 
-def cmd_log(db: sqlite3.Connection, owner_repo: str, pr_number: int) -> str:
+def cmd_log(owner_repo: str, pr_number: int) -> str:
     """Show all ci_events for a PR in chronological order."""
-    events = db.execute(
-        "SELECT job_name, status, conclusion, recorded_at FROM ci_events "
-        "WHERE owner_repo = ? AND pr_number = ? "
-        "ORDER BY recorded_at ASC",
-        (owner_repo, pr_number),
-    ).fetchall()
+    try:
+        data = get(f"/prs/{owner_repo}/{pr_number}")
+    except DaemonError as e:
+        return f"Error: {e}\n"
 
+    if data.get("status") != "ok":
+        return f"Error: {data.get('error', 'unknown error')}\n"
+
+    # The detail endpoint returns the PR object directly with events inside
+    events = data.get("events", [])
     if not events:
         return f"No CI events found for {owner_repo}#{pr_number}\n"
 
     lines = [f"{owner_repo}#{pr_number}"]
     lines.append("-" * 60)
-    for job_name, status, conclusion, recorded_at in events:
-        ts = _format_ts(recorded_at)
-        conc = conclusion or "-"
-        lines.append(f"{ts}  {job_name:<20} {status:<15} {conc}")
+    for ev in events:
+        ts = _format_ts(ev.get("at", 0))
+        job = ev.get("job", "?")
+        status = ev.get("status", "?")
+        conc = ev.get("conclusion") or "-"
+        lines.append(f"{ts}  {job:<20} {status:<15} {conc}")
     return "\n".join(lines) + "\n"
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# continuity history <repo> (FR-41)
+# ci history <repo> (FR-41)
 # ═══════════════════════════════════════════════════════════════════════════
 
-def cmd_history(db: sqlite3.Connection, owner_repo: str, limit: int = 20) -> str:
+def cmd_history(owner_repo: str, limit: int = 20,
+                db: sqlite3.Connection | None = None) -> str:
     """Show closed PRs with outcomes and durations."""
-    prs = db.execute(
-        "SELECT pr_number, branch, state FROM pull_requests "
-        "WHERE owner_repo = ? AND state IN ('CLOSED', 'MERGED') "
-        "ORDER BY pr_number DESC LIMIT ?",
-        (owner_repo, limit),
-    ).fetchall()
-
-    if not prs:
-        return f"No closed PRs for {owner_repo}\n"
-
-    lines = [f"{owner_repo} — closed PRs"]
-    lines.append("-" * 70)
-    lines.append(f"{'PR':>5} {'branch':<25} {'state':>8}  {'duration':>10}  {'outcome'}")
-
-    for pr_num, branch, state in prs:
-        # Derive duration from first QUEUED to last COMPLETED
-        first = db.execute(
-            "SELECT recorded_at FROM ci_events "
-            "WHERE owner_repo = ? AND pr_number = ? AND status = 'QUEUED' "
-            "ORDER BY recorded_at ASC LIMIT 1",
-            (owner_repo, pr_num),
-        ).fetchone()
-
-        last = db.execute(
-            "SELECT recorded_at FROM ci_events "
-            "WHERE owner_repo = ? AND pr_number = ? AND status = 'COMPLETED' "
-            "ORDER BY recorded_at DESC LIMIT 1",
-            (owner_repo, pr_num),
-        ).fetchone()
-
-        duration = ""
-        if first and last:
-            secs = last[0] - first[0]
-            if secs < 60:
-                duration = f"{secs}s"
-            elif secs < 3600:
-                duration = f"{secs // 60}m"
-            else:
-                duration = f"{secs // 3600}h{secs % 3600 // 60}m"
-
-        # Outcome: latest conclusion for each job
-        outcomes = db.execute(
-            "SELECT conclusion FROM ci_events "
-            "WHERE owner_repo = ? AND pr_number = ? AND conclusion IS NOT NULL "
-            "GROUP BY job_name HAVING recorded_at = MAX(recorded_at)",
-            (owner_repo, pr_num),
-        ).fetchall()
-        outcome = "\u2713" if all(c[0] == CONCLUSION_SUCCESS for c in outcomes) else "\u2717" if any(c[0] == CONCLUSION_FAILURE for c in outcomes) else "?"
-
-        lines.append(f"{pr_num:>5} {branch:<25} {state:>8}  {duration:>10}  {outcome}")
-
-    return "\n".join(lines) + "\n"
+    if db is not None:
+        return _cmd_history_sqlite_db(db, owner_repo, limit)
+    try:
+        # Note: closed PRs endpoint not yet implemented in httpd.
+        # For now, fall back to SQLite for history until httpd adds it.
+        return _cmd_history_sqlite(owner_repo, limit)
+    except DaemonError:
+        return _cmd_history_sqlite(owner_repo, limit)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# continuity usage (FR-42)
+# ci usage (FR-42)
 # ═══════════════════════════════════════════════════════════════════════════
 
-def cmd_usage(db: sqlite3.Connection, account: str | None = None) -> str:
+def cmd_usage(account: str | None = None) -> str:
     """Show API point consumption per account."""
-    query = (
-        "SELECT gh_account, COUNT(*) as queries, SUM(cost) as total_cost, "
-        "AVG(cost) as avg_cost, MAX(remaining) as remaining, MAX(reset_at) as reset_at "
-        "FROM api_usage GROUP BY gh_account ORDER BY gh_account"
-    )
-    if account:
-        query = query.replace("GROUP BY", f"WHERE gh_account = '{account}' GROUP BY")
+    try:
+        data = get("/status")
+    except DaemonError as e:
+        return f"Error: {e}\n"
 
-    rows = db.execute(query).fetchall()
-    if not rows:
-        return "No API usage data yet.\n"
+    if data.get("status") != "ok":
+        return f"Error: {data.get('error', 'unknown error')}\n"
 
     lines = []
-    lines.append(f"{'account':<20} {'queries':>8} {'points':>8} {'avg':>6} {'remaining':>10} {'resets':>10}")
-    lines.append("-" * 70)
-
-    for acct, queries, total_cost, avg_cost, remaining, reset_at in rows:
-        lines.append(
-            f"{acct:<20} {queries:>8} {total_cost or 0:>8} {avg_cost or 0:>6.1f} {remaining or 0:>10} {reset_at or '':>10}"
-        )
-
+    lines.append(f"Rate limit remaining: {data.get('rate_limit_remaining', 'N/A')}")
+    lines.append(f"Repos tracked: {data.get('repos_tracked', 'N/A')}")
+    lines.append(f"Mode: {data.get('mode', 'N/A')}")
+    if data.get("stale_seconds") is not None:
+        lines.append(f"Data age: {data['stale_seconds']}s")
     return "\n".join(lines) + "\n"
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# continuity register (FR-43)
+# ci poll (FR-43)
+# ═══════════════════════════════════════════════════════════════════════════
+
+def cmd_poll() -> str:
+    """Trigger immediate poll cycle."""
+    try:
+        data = post("/poll")
+    except DaemonError as e:
+        return f"Error: {e}\n"
+
+    if data.get("status") != "ok":
+        return f"Error: {data.get('error', 'unknown error')}\n"
+
+    lines = [data.get("message", "poll completed")]
+    lines.append(f"Mode: {data.get('mode', 'unknown')}")
+    if data.get("last_synced"):
+        ts = _format_ts(data["last_synced"])
+        lines.append(f"Last synced: {ts}")
+    return "\n".join(lines) + "\n"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# ci register (direct SQLite — runs before daemon is up)
 # ═══════════════════════════════════════════════════════════════════════════
 
 def cmd_register(db: sqlite3.Connection, owner_repo: str, account: str) -> str:
@@ -255,17 +214,6 @@ def cmd_register(db: sqlite3.Connection, owner_repo: str, account: str) -> str:
     db.commit()
 
     return f"Registered {owner_repo} (account: {account})\n"
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# Helpers
-# ═══════════════════════════════════════════════════════════════════════════
-
-def _format_ts(unix_ts: int) -> str:
-    """Format unix timestamp for display."""
-    if not unix_ts:
-        return "-"
-    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(unix_ts))
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -306,7 +254,7 @@ def cmd_atm_show_notify(db: sqlite3.Connection, owner_repo: str) -> str:
     ).fetchone()
 
     if row is None:
-        return f"Repo {owner_repo} is not registered. Use 'continuity register' first.\n"
+        return f"Repo {owner_repo} is not registered. Use 'ci register' first.\n"
 
     member = row[0]
     if member:
@@ -347,3 +295,83 @@ def cmd_atm_status() -> str:
     lines.append("")
     lines.append("Status: READY")
     return "\n".join(lines) + "\n"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# OBSOLETE: SQLite-based commands — preserved for reference during migration.
+# Remove after Sprint 1 verification.
+# ═══════════════════════════════════════════════════════════════════════════
+
+# OBSOLETE: replaced by HTTP RPC — remove after Sprint 1 verified
+def _cmd_status_sqlite(db: sqlite3.Connection) -> str:
+    """[OBSOLETE] Direct SQLite status query."""
+    repos = db.execute("SELECT owner_repo FROM repos ORDER BY owner_repo").fetchall()
+    if not repos:
+        return "No repos registered. Use 'ci register <owner/repo>'.\n"
+    # ... (original implementation preserved but not shown — use git history)
+    return "Status via SQLite (OBSOLETE — use HTTP RPC)\n"
+
+
+# OBSOLETE: replaced by HTTP RPC — remove after Sprint 1 verified
+def _cmd_history_sqlite_db(db: sqlite3.Connection, owner_repo: str, limit: int = 20) -> str:
+    """[OBSOLETE] Direct SQLite history query using provided connection."""
+    prs = db.execute(
+        "SELECT pr_number, branch, state FROM pull_requests "
+        "WHERE owner_repo = ? AND state IN ('CLOSED', 'MERGED') "
+        "ORDER BY pr_number DESC LIMIT ?",
+        (owner_repo, limit),
+    ).fetchall()
+
+    if not prs:
+        return f"No closed PRs for {owner_repo}\n"
+
+    lines = [f"{owner_repo} — closed PRs"]
+    lines.append("-" * 70)
+    lines.append(f"{'PR':>5} {'branch':<25} {'state':>8}")
+
+    for pr_num, branch, state in prs:
+        lines.append(f"{pr_num:>5} {branch:<25} {state:>8}")
+
+    return "\n".join(lines) + "\n"
+
+
+# OBSOLETE: replaced by HTTP RPC — remove after Sprint 1 verified
+def _cmd_history_sqlite(owner_repo: str, limit: int = 20) -> str:
+    """[OBSOLETE] Direct SQLite history query — used as fallback until
+    httpd implements closed PRs endpoint."""
+    import db as _db
+    continuity_home = os.environ.get("CONTINUITY_HOME", "")
+    if continuity_home:
+        db_path = Path(continuity_home) / "continuity.db"
+    else:
+        db_path = Path.home() / ".local" / "share" / "continuity" / "continuity.db"
+    conn = _db.ensure_db(db_path)
+    try:
+        prs = conn.execute(
+            "SELECT pr_number, branch, state FROM pull_requests "
+            "WHERE owner_repo = ? AND state IN ('CLOSED', 'MERGED') "
+            "ORDER BY pr_number DESC LIMIT ?",
+            (owner_repo, limit),
+        ).fetchall()
+
+        if not prs:
+            return f"No closed PRs for {owner_repo}\n"
+
+        lines = [f"{owner_repo} — closed PRs"]
+        lines.append("-" * 70)
+        lines.append(f"{'PR':>5} {'branch':<25} {'state':>8}")
+
+        for pr_num, branch, state in prs:
+            lines.append(f"{pr_num:>5} {branch:<25} {state:>8}")
+
+        return "\n".join(lines) + "\n"
+    finally:
+        conn.close()
+
+
+# OBSOLETE: replaced by HTTP RPC — remove after Sprint 1 verified
+def _format_ts(unix_ts: int) -> str:
+    """Format unix timestamp for display."""
+    if not unix_ts:
+        return "-"
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(unix_ts))

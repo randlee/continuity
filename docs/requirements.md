@@ -124,35 +124,43 @@ Depends on `gh/client`, `diff`, `db`. Testable with mocked `GhClient`.
 | ID | Requirement |
 |---|---|
 | FR-31 | PR_CHANGED (30s), ACTIVE (5 min), INACTIVE (20 min) adaptive modes |
-| FR-31a | POST_PUSH_DELAY: SIGUSR1 schedules first PR_CHANGED poll at now + 1 min, not immediately. First-wins: multiple signals within window do not push further |
 | FR-32 | Mode re-evaluated after each poll cycle |
-| FR-33 | `continuity register` adds repo + installs post-push hook |
+| FR-33 | `ci register` adds repo + installs post-push hook |
 | FR-36 | If rate limit remaining < LOW_WATER (1,000), double the current mode's interval regardless of mode. Restore to default when remaining recovers |
-| FR-43 | `continuity register` adds repo + installs post-push hook |
 
 **Singleton guarantees** (see Architecture §11):
 - PID file at `$CONTINUITY_HOME/daemon.pid`
 - Exclusive file lock at `$CONTINUITY_HOME/daemon.lock`
 - Second instance detects lock → reads PID → error if alive, clears if stale
 
-### 4.4 Module: `cli/daemon_cmd` — CLI Commands
+### 4.4 Module: `cli` — CLI Commands (Thin HTTP Client)
 
-Read-only SQLite queries. No `gh` calls on the read path.
+CLI commands are thin HTTP clients that call the daemon's RPC endpoints.
+They do not read SQLite directly. The daemon owns all data access and
+cache staleness logic.
 
 | ID | Requirement |
 |---|---|
-| FR-38 | All CLI commands read SQLite only — no `gh` calls |
-| FR-39 | `continuity status` renders open PRs + job states + activity mode |
-| FR-40 | `continuity log <repo> <pr#>` shows chronological `ci_events` |
-| FR-41 | `continuity history <repo>` shows closed PRs with outcomes and durations |
-| FR-42 | `continuity usage` shows API point consumption per account |
+| FR-38 | All CLI commands use daemon HTTP RPC. No direct SQLite reads from non-daemon processes |
+| FR-39 | `ci status` → `GET /prs`. Renders open PRs + job states + activity mode |
+| FR-40 | `ci log <repo> <pr#>` → `GET /prs/<owner>/<repo>/<num>`. Shows chronological `ci_events` |
+| FR-41 | `ci history <repo>` → `GET /prs?closed=true&repo=<owner>/<repo>`. Shows closed PRs with outcomes and durations |
+| FR-42 | `ci usage` → `GET /status`. Shows API point consumption per account |
+| FR-43 | `ci poll` → `POST /poll`. Triggers immediate poll cycle, returns fresh data |
+| FR-44 | CLI discovers daemon port from `$CONTINUITY_HOME/daemon.port` |
+
+**[OBSOLESCENCE]** Direct SQLite reads from CLI path are deprecated. Mark
+`_query_prs()`, `_query_pr_detail()` in CLI module with `# OBSOLETE` once
+HTTP RPC is live. Remove after task 4 verification.
 
 ### 4.5 Module: `hooks` — Post-Push Hook
 
 | ID | Requirement |
 |---|---|
-| FR-34 | Installed automatically by `continuity register` |
-| FR-33 | Sends SIGUSR1 to daemon on `git push` to origin |
+| FR-45 | Installed automatically by `ci register` |
+| FR-46 | Single cross-platform hook script — `curl -s -X POST http://localhost:$PORT/poll` |
+| FR-47 | Port discovered from `$CONTINUITY_HOME/daemon.port` (written at daemon startup) |
+| FR-48 | Hook is fire-and-forget — backgrounded, does not block git push |
 
 ### 4.6 Module: `poll` — Adaptive Interval Calculator
 
@@ -168,49 +176,44 @@ Pure function. No I/O.
 
 | ID | Requirement |
 |---|---|
-| NF-11 | Daemon is the only component that talks to GitHub. CLI reads SQLite exclusively |
+| NF-11 | Daemon is the only component that talks to GitHub and the only component that writes to SQLite. CLI reads via HTTP RPC exclusively |
 | NF-12 | `ci_events` is append-only. No UPDATE or DELETE on that table |
 | NF-13 | Bearer tokens never written to disk by continuity |
 | NF-14 | No subprocesses in the hot path (poll loop). Only `gh auth token` at startup |
 | NF-15 | Trigger callbacks fire in spawned tasks. Main poll loop is never blocked by a trigger |
 | NF-16 | SQLite in WAL mode. Daemon writes; CLI reads concurrently without blocking |
 
-## 5. Phase 5 — Resilience & Anomaly Detection
-
-### 5.1 Module: `monitor` — Job Duration Tracking
-
-Tracks queue time and execution time separately. Long queues are not
-anomalies — only abnormal execution times are.
+### 4.7 Module: `interceptor` — Daemon Wake on PR Create
 
 | ID | Requirement |
 |---|---|
-| FR-44 | `execution_time_ms(job)` = IN_PROGRESS → COMPLETED delta. Queue time tracked separately as QUEUED → IN_PROGRESS |
-| FR-45 | EMA of execution time per (repo, job_name). Recalculated on each COMPLETED event |
-| FR-46 | EMA of queue time per (repo, job_name). Informational only — does not trigger alerts |
-| FR-47 | Anomaly detection: execution_time > 5× ema_execution → "hung" event in `monitor_events` |
-| FR-48 | Stale detection: job in IN_PROGRESS for > 2× ema_execution without completing → "slow" event |
-| FR-49 | Backoff on transient failures: exponential with cap, retry limit per daemon config |
-
-**Public API (pure functions):**
-```python
-def calc_queue_time(events: list[CiEvent]) -> int | None: ...
-def calc_execution_time(events: list[CiEvent]) -> int | None: ...
-def update_ema(current_ema: float, new_value: int, alpha: float = 0.2) -> float: ...
-def is_anomaly(execution_ms: int, ema_ms: float, threshold: float = 5.0) -> bool: ...
-```
-| NF-17 | `CONTINUITY_DB` overrides database path for all components |
+| FR-50 | Interceptor calls `POST /poll` on daemon HTTP RPC after logging `gh pr create` |
+| FR-51 | Wake is fire-and-forget — interceptor does not block on daemon response |
+| FR-52 | Wake uses the canonical `POST /poll` endpoint. No platform-specific signal code in the interceptor |
 
 ## 5. Phase 5 — Resilience (Slow/Timeout Detection + EMA)
 
-### Functional
+**Note:** Two complementary paths:
+- **Daemon poll** — updates EMA on CI completion. Does NOT emit slow/timeout alerts.
+- **Interceptor** (Sprint 5) — detects slow/timeout when agents run `gh pr view`/`gh pr checks`. Emits `CiSlow`/`CiTimeout` events.
+
+### 5.1 DAEMON: EMA Tracking on CI Completion
 
 | ID | Requirement |
 |---|---|
-| FR-44 | `avg_ci_duration` updated as EMA (α=0.2) on `conclusion = SUCCESS` only |
-| FR-45 | Minimum 3 successful runs before thresholds apply |
-| FR-46 | `CiSlow` trigger fires when elapsed > 2× avg_ci_duration (non-fatal, CI continues) |
-| FR-47 | `CiTimeout` trigger fires when elapsed > max_ci_duration (or 2× avg if NULL) |
-| FR-48 | Slow/timeout triggers fire at most once per CI run |
+| FR-53 | `avg_ci_duration` updated as EMA (α=0.2) on `conclusion = SUCCESS` only, by daemon poll |
+| FR-54 | Minimum 3 successful runs before thresholds apply |
+| FR-55 | EMA persisted in `repos.avg_ci_duration` column |
+
+### 5.2 INTERCEPTOR: Slow/Timeout Detection (Sprint 5)
+
+| ID | Requirement |
+|---|---|
+| FR-56 | `CiSlow` trigger fires when elapsed > 2× avg_ci_duration (non-fatal, CI continues) — detected by interceptor on `gh pr view`/`gh pr checks` |
+| FR-57 | `CiTimeout` trigger fires when elapsed > max_ci_duration (or 2× avg if NULL) — detected by interceptor |
+| FR-58 | Slow/timeout triggers fire at most once per CI run |
+| FR-59 | Interceptor reads `avg_ci_duration` and `max_ci_duration` from `repos` table |
+| FR-60 | Interceptor captures `ATM_IDENTITY` for notification routing
 
 ## 6. Phase 6 — Extension Points (ATM / sc-mux)
 
@@ -218,8 +221,8 @@ def is_anomaly(execution_ms: int, ema_ms: float, threshold: float = 5.0) -> bool
 
 | ID | Requirement |
 |---|---|
-| FR-49 | Trigger events emitted as structured log entries with action, level, and typed fields |
-| FR-52 | Extension consumers have no dependency on continuity internals |
+| FR-61 | Trigger events emitted as structured log entries with action, level, and typed fields |
+| FR-62 | Extension consumers have no dependency on continuity internals |
 
 ### 6.2 ATM Notifications — see [requirements-atm.md](requirements-atm.md)
 
@@ -245,7 +248,7 @@ Key design points:
 
 | ID | Requirement |
 |---|---|
-| FR-51 | sc-mux dashboard reads continuity SQLite for CI status per registered repo/session |
+| FR-63 | sc-mux dashboard reads continuity SQLite for CI status per registered repo/session |
 
 ### Non-Functional
 
@@ -254,13 +257,35 @@ Key design points:
 | NF-18 | ATM message delivery is fire-and-forget. Failed delivery does not block the poll loop |
 | NF-19 | Dashboard reads are non-critical. A slow query does not affect `atm send` or daemon operation |
 
-## 7. CLI Command Summary
+## 8. Active Implementation Tasks
 
-| Command | gh calls | Description |
+Prioritized from architecture §14. Obsolescence convention: old code is
+marked `# OBSOLETE` but NOT deleted until new path is verified.
+
+| # | Task | Effort | Depends On | Makes Obsolete |
+|:---:|:---|:---:|:---:|:---|
+| 1 | Dead code cleanup | Small | — | `_check_monitor`, unused event types in `notify.py` |
+| 2 | Rate limit cost logging + tune `LOW_WATER` | Small | — | — |
+| 3 | PR create → `POST /poll` in interceptor | Small | 4 | — |
+| 4 | CLI commands use HTTP RPC | Medium | — | Direct SQLite reads from CLI |
+| 5 | `CiSlow`/`CiTimeout` in interceptor parse path | Medium | — | Daemon-side slow/timeout detection |
+| 6 | End-to-end integration test | Medium | 3, 4, 5 | — |
+
+### Obsolescence Convention
+
+1. Add `# OBSOLETE: replaced by <mechanism> — remove after task <#> verified` above old code.
+2. Keep old code alongside new until tests validate the replacement.
+3. Remove in a dedicated cleanup commit after verification.
+4. Move completed task from this table to Done.
+
+## 9. CLI Command Summary
+
+| Command | Calls | Description |
 |---|---|---|
-| `continuity daemon` | Auth at startup only | Start the poll daemon. Blocks. |
-| `continuity register <owner/repo> --account <name>` | 1 (auth verify) | Add repo to tracking. Install post-push hook. |
-| `continuity status` | None | Show all open PRs + current job states from SQLite. |
-| `continuity log <repo> <pr#>` | None | Show all ci_events for a PR in order. |
-| `continuity history <repo> [--limit N]` | None | Show closed PRs with CI outcomes and durations. |
-| `continuity usage [--account <name>]` | None | Show api_usage summary per account. |
+| `ci daemon` | Auth at startup only | Start the poll daemon. Blocks. |
+| `ci register <owner/repo> --account <name>` | 1 (auth verify) | Add repo to tracking. Install post-push hook. |
+| `ci status` | `GET /prs` | Show all open PRs + current job states via HTTP RPC. |
+| `ci log <repo> <pr#>` | `GET /prs/<owner>/<repo>/<num>` | Show all ci_events for a PR via HTTP RPC. |
+| `ci history <repo> [--limit N]` | `GET /prs?closed=true` | Show closed PRs with CI outcomes via HTTP RPC. |
+| `ci usage [--account <name>]` | `GET /status` | Show API point consumption via HTTP RPC. |
+| `ci poll` | `POST /poll` | Trigger immediate poll cycle. |

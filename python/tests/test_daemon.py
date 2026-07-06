@@ -129,12 +129,6 @@ class TestSignals:
         d.shutdown()
         assert d._shutdown_flag
 
-    def test_sigusr1_sets_wake_event(self, daemon_home, db_conn, mock_client):
-        d = Daemon(daemon_home, {"test": mock_client}, db_conn)
-        assert not d._wake_event
-        d._wake()
-        assert d._wake_event
-
     def test_shutdown_stops_loop(self, daemon_home, db_conn, mock_client):
         d = Daemon(daemon_home, {"test": mock_client}, db_conn)
         d._shutdown_flag = True  # simulate SIGTERM
@@ -383,32 +377,8 @@ class TestAdr:
 # POST_PUSH_DELAY + mode transition edge cases (to be fixed)
 # ═══════════════════════════════════════════════════════════════════════════
 
-class TestPostPushDelay:
-    """Tests for POST_PUSH_DELAY behavior and mode transitions."""
-
-    def test_wake_sets_pr_changed_mode(self, daemon_home, db_conn, mock_client):
-        """GAP: _wake should immediately set mode to PR_CHANGED."""
-        d = Daemon(daemon_home, {"test": mock_client}, db_conn)
-        assert d.mode == ActivityMode.INACTIVE
-
-        d._wake()
-        assert d.mode == ActivityMode.PR_CHANGED, (
-            "_wake should set mode to PR_CHANGED immediately"
-        )
-        assert d._wake_event is True
-        assert d._scheduled_wake_at > 0
-
-    def test_first_wins_multiple_wakes(self, daemon_home, db_conn, mock_client):
-        """GAP: first SIGUSR1 wins; subsequent signals within delay window ignored."""
-        d = Daemon(daemon_home, {"test": mock_client}, db_conn)
-        d._wake()
-        first_scheduled = d._scheduled_wake_at
-
-        # Second wake within window → ignored
-        d._wake()
-        assert d._scheduled_wake_at == first_scheduled, (
-            "first-wins: second wake should not change scheduled time"
-        )
+class TestModeTransitions:
+    """Tests for mode recalculation logic."""
 
     def test_pr_changed_persists_while_unknown(self, daemon_home, db_conn, mock_client):
         """PR_CHANGED stays active as long as mergeable remains UNKNOWN."""
@@ -452,18 +422,6 @@ class TestPostPushDelay:
         d._recalculate_mode()
         assert d.mode == ActivityMode.ACTIVE, (
             "Should transition to ACTIVE when mergeable is no longer UNKNOWN and CI running"
-        )
-
-    def test_recalculate_mode_overridden_by_pending_wake(self, daemon_home, db_conn, mock_client):
-        """GAP: If _wake_event is set, _recalculate_mode should honor it."""
-        d = Daemon(daemon_home, {"test": mock_client}, db_conn)
-        d._wake()  # sets mode to PR_CHANGED, schedules wake
-
-        # Simulate what happens after a poll: _recalculate_mode sees no UNKNOWN, no CI
-        # and would set INACTIVE — but a wake was requested during the poll
-        d._recalculate_mode()
-        assert d.mode == ActivityMode.PR_CHANGED, (
-            "Pending wake should keep mode at PR_CHANGED after recalculation"
         )
 
 
@@ -532,37 +490,24 @@ class TestMonitorIntegration:
 # ═══════════════════════════════════════════════════════════════════════════
 
 class TestDaemonHelpers:
-    def test_sleep_interruptible_wakes_at_scheduled_time(self, daemon_home, db_conn, mock_client):
-        """_sleep_interruptible returns early when scheduled wake time arrives."""
+    def test_sleep_interruptible_sleeps_full(self, daemon_home, db_conn, mock_client):
+        """_sleep_interruptible sleeps full duration when not interrupted."""
         d = Daemon(daemon_home, {"test": mock_client}, db_conn)
-        d._wake_event = True
-        d._scheduled_wake_at = time.time() + 0.05  # 50ms from now
-
-        start = time.time()
-        d._sleep_interruptible(10.0)  # 10s sleep, should wake at 50ms
-        elapsed = time.time() - start
-        assert elapsed < 1.0, f"Sleep took {elapsed}s, should wake at ~0.05s"
-
-    def test_sleep_interruptible_ignores_past_wake(self, daemon_home, db_conn, mock_client):
-        """_sleep_interruptible ignores stale wake time in the past."""
-        d = Daemon(daemon_home, {"test": mock_client}, db_conn)
-        d._wake_event = True
-        d._scheduled_wake_at = time.time() - 60  # 60s ago — already passed
-
-        start = time.time()
-        d._sleep_interruptible(0.1)  # short sleep, should wake on deadline
-        elapsed = time.time() - start
-        assert elapsed < 1.0, f"Sleep took {elapsed}s, should return quickly"
-
-    def test_sleep_interruptible_no_wake_sleeps_full(self, daemon_home, db_conn, mock_client):
-        """_sleep_interruptible sleeps full duration when no wake scheduled."""
-        d = Daemon(daemon_home, {"test": mock_client}, db_conn)
-        d._wake_event = False
 
         start = time.time()
         d._sleep_interruptible(0.1)  # 100ms
         elapsed = time.time() - start
         assert elapsed >= 0.08, f"Sleep took only {elapsed}s, should sleep ~0.1s"
+
+    def test_sleep_interruptible_exits_on_shutdown(self, daemon_home, db_conn, mock_client):
+        """_sleep_interruptible exits immediately when shutdown is set."""
+        d = Daemon(daemon_home, {"test": mock_client}, db_conn)
+        d._shutdown_flag = True
+
+        start = time.time()
+        d._sleep_interruptible(10.0)  # 10s sleep, should exit immediately
+        elapsed = time.time() - start
+        assert elapsed < 1.0, f"Sleep took {elapsed}s, should exit immediately on shutdown"
 
     def test_min_rate_limit_remaining_no_clients(self, daemon_home, db_conn):
         """Returns 5000 when no clients are configured."""

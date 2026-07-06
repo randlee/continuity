@@ -38,6 +38,9 @@ ATM_CI_IDENTITY = "ci"
 TERMINAL_STATUSES = frozenset({STATUS_COMPLETED})
 ACTIVE_STATUSES = frozenset({STATUS_QUEUED, STATUS_IN_PROGRESS})
 
+# HTTP RPC port
+DEFAULT_PORT = 9119
+
 # Status mapping: incoming GitHub statuses → canonical statuses
 STATUS_MAP = {
     "QUEUED": STATUS_QUEUED,

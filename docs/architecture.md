@@ -18,14 +18,15 @@ Two complementary data sources feed the system:
    adaptive interval. This catches events from outside the CLI (web UI,
    other users, CI completion).
 
-Both paths write to the same SQLite event log. Consumers (agents via ATM,
-dashboards via sc-mux) read from SQLite and a structured log stream.
+Both paths write to the same SQLite event log. Agents receive notifications
+via ATM; the CLI and sc-mux dashboard read through the daemon's HTTP RPC
+server (§12) or SQLite directly (sc-mux only).
 
 ## 2. Goals
 
 - Single source of truth for "what is the CI state of this repo/PR"
-- Agents never poll GitHub directly — they read their ATM inbox or query
-  continuity's SQLite
+- Agents never poll GitHub directly — they receive ATM notifications
+  or query the daemon's HTTP RPC
 - Immutable audit trail of every state transition
 - Adaptive polling conserves API tokens
 - CLI interception provides immediate visibility with no polling overhead
@@ -53,20 +54,20 @@ dashboards via sc-mux) read from SQLite and a structured log stream.
                  │                   │
                  │  ┌─────────────┐  │
                  │  │ CLI shim    │  │  ← transparent gh/git wrappers
-                 │  │ (intercept) │  │
+                 │  │ (intercept) │  │     (wakes daemon on pr create)
                  │  └──────┬──────┘  │
                  │         │         │
                  │  ┌──────▼──────┐  │
-                 │  │ Poll daemon │  │  ← GraphQL polling loop
-                 │  │ (future)    │  │
+                 │  │ Poll daemon │  │  ← GraphQL polling + HTTP RPC
+                 │  │  + HTTPD    │  │
                  │  └──────┬──────┘  │
                  │         │         │
                  │  ┌──────▼──────┐  │
                  │  │   SQLite    │  │  ← append-only ci_events
-                 │  │   + JSONL   │  │     structured log stream
-                 │  └──────┬──────┘  │
-                 └─────────┼─────────┘
-                           │
+                 │  │   + JSONL   │  │
+                 │  └─────────────┘  │
+                 └─────────┬─────────┘
+                           │ HTTP RPC (CLI) / SQLite (sc-mux)
               ┌────────────┼────────────┐
               │            │            │
          ┌────▼───┐  ┌─────▼──────┐  ┌─▼──────────┐
@@ -85,13 +86,17 @@ identical stdin/stdout/stderr/exit code. Zero observable difference.
 
 **Intercepted commands of interest:**
 
-| Command | Structured data extracted |
-|---|---|
-| `gh pr create` | PR number, branch, repo |
-| `gh pr merge` | PR merged event |
-| `gh pr checks` | CI job statuses |
-| `gh pr view --json` | PR metadata + CI status rollup |
-| `git push` | Push event (potential CI trigger) |
+| Command | Structured data extracted | Daemon wake |
+|---|---|---|
+| `gh pr create` | PR number, branch, repo | Yes — `POST /poll` |
+| `gh pr merge` | PR merged event | — |
+| `gh pr checks` | CI job statuses | — |
+| `gh pr view --json` | PR metadata + CI status rollup | — |
+| `git push` | Push event (potential CI trigger) | Yes (post-push hook) |
+
+After logging, the interceptor wakes the daemon on `gh pr create` via the
+HTTP RPC `/poll` endpoint (see §12). This gives new PRs immediate
+PR_CHANGED entry without waiting for the next scheduled poll.
 
 ### 5.2 Poll Daemon (Phase 3+)
 
@@ -101,7 +106,7 @@ A persistent daemon that polls GitHub GraphQL on an adaptive interval.
 1. Startup: open SQLite, authenticate via `gh auth token` (tokens in memory only)
 2. Loop: sleep → query all repos per account → diff against SQLite → record
    changes → re-evaluate interval
-3. Shutdown: SIGTERM graceful exit, SIGUSR1 immediate poll
+3. Shutdown: SIGTERM graceful exit. Wake: HTTP `POST /poll` (see §12).
 
 **State diffing:** Incoming job states are compared against the latest
 `ci_events` row per (repo, PR, job). A new row is inserted only when status
@@ -120,24 +125,20 @@ The poll daemon operates in three modes, re-evaluated after each cycle:
 
 | Mode | Interval | Entry | Exit |
 |---|---|---|---|
-| PR_CHANGED | 30s | SIGUSR1 (push or PR create) | `is_mergeable` ≠ UNKNOWN |
+| PR_CHANGED | 30s | Daemon wake (push or PR create) | `is_mergeable` ≠ UNKNOWN |
 | ACTIVE | 5 min | CI job QUEUED or IN_PROGRESS | All CI jobs complete |
-| INACTIVE | 20 min | No CI, no recent push | SIGUSR1 → PR_CHANGED |
+| INACTIVE | 20 min | No CI, no recent push | Daemon wake → PR_CHANGED |
+
+**Daemon wake mechanism:** `POST /poll` on the HTTP RPC server (see §12)
+immediately transitions the daemon to PR_CHANGED mode. The 30s poll interval
+handles timing naturally — the first poll may return UNKNOWN (GitHub can
+take up to ~60s to compute mergeability after a push), but the second poll
+30s later catches it. No separate delay timer is needed; the mode's own
+interval is the pacing mechanism.
 
 **PR_CHANGED (30s):** The critical post-push inspection window. Entered
-immediately on SIGUSR1 from a post-push hook or PR create event. Exits
-when GitHub has computed the mergeable state (no longer UNKNOWN). This
-replaces the previous ACTIVE=30s mode — the old 30s interval was too
-aggressive for CI monitoring (minutes-long runs) but too slow for the
-post-push mergeability check (seconds matter).
-
-**POST_PUSH_DELAY = 1 min (ADR-20):** On SIGUSR1, the daemon does not
-poll immediately. It schedules the first PR_CHANGED poll at `now + 1 min`.
-GitHub takes approximately 1 minute to compute `is_mergeable` after a
-push. Polling immediately returns UNKNOWN reliably. The 1-minute delay
-gives high confidence of getting the computed state on the first try.
-Multiple SIGUSR1 within the delay window: first-wins — subsequent signals
-do not push the scheduled poll further out.
+immediately on daemon wake from a post-push hook or PR create event. Exits
+when GitHub has computed the mergeable state (no longer UNKNOWN).
 
 **ACTIVE = 5 min (ADR-21):** The original ACTIVE=30s was too aggressive.
 CI runs take minutes; 30s provides no useful new information for most of
@@ -146,12 +147,11 @@ at 5 min provides reasonable status cadence without wasting API budget.
 
 **INACTIVE = 20 min:** No CI running, no recent push. This is not "no
 open PRs" — open PRs can exist. It simply means nothing is happening
-right now. SIGUSR1 from a post-push hook immediately transitions to
-PR_CHANGED.
+right now. A daemon wake immediately transitions to PR_CHANGED.
 
-**CLI cache:** If `last_polled_at` is within 30s of now, `continuity
-status` and similar read commands return SQLite state without an API
-call. If ≥ 30s, execute a GraphQL query and reset the poll timer.
+**CLI cache:** The HTTPD handler checks `last_synced` staleness internally.
+If data is fresh (< 30s), the response returns immediately from SQLite.
+If stale, the handler triggers an on-demand GraphQL poll before responding.
 
 ### Rate Limit Model
 
@@ -230,14 +230,14 @@ HAVING recorded_at = MAX(recorded_at);
 State changes produce structured trigger events. These are the extension
 points for ATM messaging and dashboard notifications.
 
-| Event | Condition |
-|---|---|
-| `PrConflictDetected` | mergeable = CONFLICTING detected |
-| `CiStarted` | First job transitions to QUEUED or IN_PROGRESS |
-| `CiJobChanged` | Any job status or conclusion transition |
-| `CiCompleted` | All jobs in terminal state |
-| `CiSlow` | Elapsed > 2× avg_ci_duration (non-fatal) |
-| `CiTimeout` | Elapsed > max_ci_duration |
+| Event | Condition | Source |
+|---|---|---|
+| `PrConflictDetected` | mergeable = CONFLICTING detected | Daemon poll |
+| `CiStarted` | First job transitions to QUEUED or IN_PROGRESS | Daemon poll |
+| `CiJobChanged` | Any job status or conclusion transition | Daemon poll |
+| `CiCompleted` | All jobs in terminal state | Daemon poll |
+| `CiSlow` | Elapsed > 2× avg_ci_duration (non-fatal) | Interceptor (Sprint 5) |
+| `CiTimeout` | Elapsed > max_ci_duration | Interceptor (Sprint 5) |
 
 ## 9. Extension Points
 
@@ -260,9 +260,9 @@ Subject: PR #42 unmergable — merge conflict in 3 files
 
 **Notification routing** follows a single principle: whoever can fix the
 problem gets notified. If they can't be reached, `team-lead` handles it.
-Agent-driven events (PR create, push) route to the requesting agent;
-daemon-detected events (CI completion, slow, timeout) and cascades always
-route to `team-lead`. Full routing matrix and fallback chain in
+Agent-driven events (PR create, push, slow/timeout) route to the
+requesting agent; daemon-detected events (CI completion, conflict
+detection) route to `team-lead`. Full routing matrix and fallback chain in
 [ADR 001](adr/001-atm-notifications.md).
 
 **Transient failures** (socket timeout, lock contention) retry 3× with
@@ -296,16 +296,29 @@ Read path is non-critical — a slow dashboard load does not block
 
 ### 9.3 Post-Push Hook
 
-Optional hook installed by `continuity register`:
+Installed by `continuity register`. Single cross-platform script — `curl`
+to the daemon's HTTP RPC `/poll` endpoint. Port discovered from
+`$CONTINUITY_HOME/daemon.port` (written at startup).
+
+**Unix:**
 ```sh
 #!/bin/sh
 # .git/hooks/post-push
 [ "$1" = "origin" ] || exit 0
-pkill -SIGUSR1 -x continuity 2>/dev/null || true
+PORT=$(cat "$CONTINUITY_HOME/daemon.port" 2>/dev/null)
+curl -s -X POST "http://localhost:$PORT/poll" >/dev/null 2>&1 &
 ```
 
-Wakes the daemon immediately on push rather than waiting for the next
-scheduled poll.
+**Windows:**
+```bat
+@echo off
+REM .git\hooks\post-push.bat
+if /I not "%1"=="origin" exit /b 0
+set /p PORT=<"%CONTINUITY_HOME%\daemon.port"
+curl -s -X POST http://localhost:%PORT%/poll >nul 2>&1
+```
+
+Single wake path, cross-platform, debuggable.
 
 ## 10. Auth Model
 
@@ -362,7 +375,51 @@ def daemon():
     assert not Path(home, "daemon.pid").exists(), "PID file not cleaned"
 ```
 
-## 12. Key Design Decisions
+## 12. HTTP RPC Daemon Interface
+
+The daemon exposes a minimal HTTP RPC server on `localhost`. This is the
+canonical interface for CLI commands and external wake events. Direct
+SQLite reads from non-daemon processes are deprecated — the daemon owns
+all data access.
+
+### 12.1 Endpoints
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/status` | Daemon mode, rate limits, repo count, last synced |
+| `GET` | `/prs` | All open PRs with current CI job states |
+| `GET` | `/prs/<owner>/<repo>/<num>` | Single PR detail + ci_events log |
+| `POST` | `/poll` | Trigger immediate poll cycle, return fresh data |
+
+### 12.2 Wake-on-Create
+
+The interceptor calls `POST /poll` after logging a `gh pr create` event.
+This immediately transitions the daemon to PR_CHANGED mode so the new PR
+gets 30s polling without waiting for the next scheduled cycle.
+
+### 12.3 Port Discovery
+
+The daemon writes its port to `$CONTINUITY_HOME/daemon.port` at startup.
+CLI commands and hooks read this file to discover the endpoint.
+
+### 12.4 CLI as Thin Client
+
+CLI commands (`ci status`, `ci log`, `ci history`) are thin HTTP clients
+that call the daemon's RPC endpoints. They do not read SQLite directly.
+The daemon owns cache staleness logic: stale data triggers an on-demand
+poll; fresh data returns immediately.
+
+**Design rationale:**
+- **Single writer**: Only the daemon writes to SQLite. Eliminates WAL
+  contention and stale-read edge cases.
+- **Cross-platform**: HTTP works everywhere. No signal imports, no
+  platform-specific hooks.
+- **Debuggable**: `POST /poll` returns JSON with poll outcome and
+  rate-limit info.
+- **Unified wake**: Interceptor, post-push hook, and manual `ci poll`
+  all use the same `POST /poll` endpoint.
+
+## 13. Key Design Decisions
 
 | Decision | Rationale |
 |---|---|
@@ -371,8 +428,30 @@ def daemon():
 | GraphQL batch query per account | One API call covers all repos and all PRs. O(accounts), not O(repos). |
 | Persistent daemon | Holds tokens in memory. Eliminates per-poll auth subprocess overhead. |
 | Adaptive poll interval | Conserves API tokens. Three modes: PR_CHANGED (30s post-push), ACTIVE (5 min CI running), INACTIVE (20 min no activity) |
-| POST_PUSH_DELAY (ADR-20) | GitHub takes ~1 min to compute is_mergeable. Delay first poll after push to avoid UNKNOWN. First-wins: multiple signals within window don't push further |
 | ACTIVE=5 min (ADR-21) | 30s was too aggressive for CI monitoring. PR_CHANGED handles the critical post-push window at 30s. ACTIVE at 5 min provides reasonable cadence |
 | SQLite (not Postgres/MySQL) | Single binary, no server. WAL mode for concurrent reads. |
-| CLI reads SQLite only | Status is always instant. No API calls on the read path. |
+| CLI as HTTP thin client | All CLI commands read via daemon HTTP RPC. Daemon owns data access and cache staleness. Cross-platform, debuggable, single-writer. Replaces direct SQLite reads. |
+| Wake via `POST /poll` | Single wake path for hook, interceptor, and manual `ci poll`. HTTP works everywhere, returns acknowledgement. No SIGUSR1, no platform branches. |
 | Three-source architecture | Interception + polling + structured log. Each adds data without replacing the others. |
+
+## 14. Remaining Implementation Tasks
+
+Prioritized. Each task includes obsolescence markers: code that should be
+flagged for removal when replaced.
+
+| # | Task | Effort | Makes Obsolete |
+|:---:|:---|:---:|:---|
+| 1 | Dead code cleanup — `_check_monitor` (~460 lines in `daemon.py`), `CiSlow`/`CiTimeout` event types in `notify.py` | Small | Remove `_check_monitor` and unused event types |
+| 2 | Rate limit cost logging — `logger.info("poll cost: %d points", rl.cost)` on first run, tune `LOW_WATER` | Small | — |
+| 3 | PR create → daemon wake — interceptor sends `POST /poll` on `gh pr create`. (Requires task 4; becomes a one-liner once HTTP RPC is the CLI path.) | Small | — |
+| 4 | CLI commands use HTTP — `ci status` → `GET /prs`, `ci log` → `GET /prs/:repo/:num`. Daemon owns data; CLI is thin client. | Medium | Deprecate direct SQLite reads from CLI |
+| 5 | `CiSlow`/`CiTimeout` wired to interceptor — move detection from daemon poll to `gh pr view`/`gh pr checks` interceptor path | Medium | Remove daemon-side slow/timeout detection |
+| 6 | Integration test — end-to-end: interceptor captures identity → daemon detects conflict → ATM notification fires | Medium | — |
+
+### Obsolescence Convention
+
+When code is replaced by a new implementation:
+1. Add `# OBSOLETE: replaced by <mechanism> — remove after <task #> verified` above the old code.
+2. Do NOT delete the old code in the same commit that adds its replacement — let tests validate the new path first.
+3. Once the new path is verified (tests pass, CI green), remove the old code in a dedicated cleanup commit.
+4. Update this section: move the completed task to a "Done" table and drop its obsolescence marker.

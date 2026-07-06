@@ -38,8 +38,8 @@ class TestInstall:
     def test_hook_contains_continuity(self, repo):
         path = install(repo)
         content = path.read_text()
-        assert "continuity" in content
-        assert "SIGUSR1" in content
+        assert "curl" in content
+        assert "/poll" in content
         assert "origin" in content
 
     def test_idempotent(self, repo):
@@ -95,11 +95,12 @@ class TestHookScript:
     def test_uses_continuity_home(self):
         """Hook should use CONTINUITY_HOME or default."""
         assert "CONTINUITY_HOME" in HOOK_SCRIPT
-        assert "daemon.pid" in HOOK_SCRIPT
+        assert "daemon.port" in HOOK_SCRIPT
 
-    def test_sends_sigusr1(self):
-        """Hook should send SIGUSR1 to daemon."""
-        assert "SIGUSR1" in HOOK_SCRIPT
+    def test_uses_curl_poll(self):
+        """Hook uses curl POST /poll to wake daemon."""
+        assert "curl" in HOOK_SCRIPT
+        assert "/poll" in HOOK_SCRIPT
 
 
 class TestAdr:
@@ -110,9 +111,10 @@ class TestAdr:
         assert path.exists()
         assert is_installed(repo)
 
-    def test_FR33_sends_sigusr1(self, repo):
-        """FR-33: Hook sends SIGUSR1 on push to origin."""
+    def test_FR45_hook_uses_curl_poll(self, repo):
+        """FR-45/FR-46: Hook uses curl POST /poll to wake daemon on push."""
         path = install(repo)
         content = path.read_text()
-        assert "SIGUSR1" in content
+        assert "curl" in content
+        assert "/poll" in content
         assert "origin" in content

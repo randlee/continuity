@@ -6,9 +6,11 @@ DB, writes ci_events/pull_requests, manages adaptive mode transitions.
 Singleton: PID file + lock directory (cross-platform, no fcntl).
 Testable with mocked GhClient.
 
+Wake mechanism: HTTP `POST /poll` on the HTTP RPC server. No SIGUSR1.
+
 Public API:
     Daemon(home, gh_clients, db)
-    .start()      — acquire lock, enter poll loop
+    .start()      — acquire lock, write PID + port, enter poll loop
     .shutdown()   — SIGTERM handler, release lock, flush
 """
 
@@ -37,6 +39,7 @@ from constants import (
     PR_STATE_OPEN, PR_STATE_MERGED, PR_STATE_CLOSED,
     CONCLUSION_SUCCESS, CONCLUSION_FAILURE,
     TERMINAL_STATUSES, ACTIVE_STATUSES,
+    DEFAULT_PORT,
 )
 
 logger = logging.getLogger(__name__)
@@ -57,8 +60,9 @@ class DaemonConfig:
     pr_changed_interval: int = 30
     active_interval: int = 300           # 5 min (ADR-21)
     inactive_interval: int = 1200         # 20 min
-    post_push_delay: int = 60             # 1 min (ADR-20)
-    low_water: int = 1000                 # rate limit remaining threshold
+    # LOW_WATER — rate limit remaining threshold. Tune after dogfooding
+    # cost logs. Typical burn ~425/hr against 5000/hr budget.
+    low_water: int = 1000
     max_backoff: int = 3600               # max interval when rate limited
     backoff_multiplier: float = 2.0
 
@@ -84,9 +88,8 @@ class Daemon:
         self.mode = ActivityMode.INACTIVE
         self._lock_dir = self.home / "daemon.lock"
         self._shutdown_flag = False
-        self._wake_event = False
-        self._scheduled_wake_at: float = 0.0
         self._pid_file = self.home / "daemon.pid"
+        self._port_file = self.home / "daemon.port"
         # Monitor state: EMA tracking per (repo, job_name)
         self._ema: dict[tuple[str, str], float] = {}
         self._ema_count: dict[tuple[str, str], int] = {}
@@ -97,7 +100,7 @@ class Daemon:
     # ── Lifecycle ────────────────────────────────────────────────────────
 
     def start(self):
-        """Acquire singleton lock, write PID, enter poll loop."""
+        """Acquire singleton lock, write PID + port, enter poll loop."""
         self.home.mkdir(parents=True, exist_ok=True)
         self._acquire_lock()
         self._write_pid()
@@ -111,6 +114,9 @@ class Daemon:
         ))
         self._httpd = start_httpd(self, db_path)
 
+        # Write port file for hook/interceptor/CLI discovery
+        self._port_file.write_text(str(DEFAULT_PORT))
+
         try:
             self._run_loop()
         finally:
@@ -119,20 +125,6 @@ class Daemon:
     def shutdown(self, signum=None, frame=None):
         """SIGTERM handler. Sets shutdown flag for graceful exit."""
         self._shutdown_flag = True
-
-    def _wake(self, signum=None, frame=None):
-        """SIGUSR1 handler. Immediately enters PR_CHANGED mode.
-
-        ADR-20: POST_PUSH_DELAY = 1 min. GitHub takes ~1 min to compute
-        is_mergeable after a push. The first SIGUSR1 sets the wake time;
-        subsequent signals within the delay window are ignored (first-wins).
-        """
-        now = time.time()
-        if self._wake_event and self._scheduled_wake_at > now:
-            return  # first-wins: already scheduled, ignore
-        self._scheduled_wake_at = now + self.config.post_push_delay
-        self._wake_event = True
-        self.mode = ActivityMode.PR_CHANGED
 
     # ── Singleton guard ──────────────────────────────────────────────────
 
@@ -165,19 +157,21 @@ class Daemon:
             return None
 
     def _cleanup(self):
-        """Release lock, remove PID file."""
+        """Release lock, remove PID and port files."""
         try:
             self._lock_dir.rmdir()
         except (FileNotFoundError, OSError):
             pass
         self._pid_file.unlink(missing_ok=True)
+        self._port_file.unlink(missing_ok=True)
 
     # ── Signal handling ──────────────────────────────────────────────────
 
     def _setup_signals(self):
-        """Register SIGTERM and SIGUSR1 handlers."""
-        signal.signal(signal.SIGTERM, self.shutdown)
-        signal.signal(signal.SIGUSR1, self._wake)
+        """Register SIGTERM handler for graceful shutdown.
+        No SIGUSR1 — wake is via HTTP POST /poll."""
+        if sys.platform != "win32":
+            signal.signal(signal.SIGTERM, self.shutdown)
 
     # ── Poll loop ────────────────────────────────────────────────────────
 
@@ -190,29 +184,17 @@ class Daemon:
             if self._shutdown_flag:
                 break
 
-            self._wake_event = False
-            self._scheduled_wake_at = 0.0
             with self._poll_lock:
                 self._poll_cycle()
             self._recalculate_mode()
 
-
     def _sleep_interruptible(self, seconds: float):
-        """Sleep until seconds elapsed, scheduled wake, or shutdown."""
+        """Sleep until seconds elapsed or shutdown. Checks every 0.5s."""
         deadline = time.time() + seconds
         while time.time() < deadline:
             if self._shutdown_flag:
                 return
-            if self._wake_event and time.time() >= self._scheduled_wake_at:
-                return
-            remaining = min(
-                deadline - time.time(),
-                self._scheduled_wake_at - time.time() if self._wake_event else 999,
-                0.5,
-            )
-            if remaining <= 0:
-                return
-            time.sleep(min(remaining, 0.5))
+            time.sleep(min(deadline - time.time(), 0.5))
 
     # ── Poll cycle ───────────────────────────────────────────────────────
 
@@ -403,7 +385,7 @@ class Daemon:
         return {r[0]: PrState(number=r[0], state=r[1], mergeable=r[2] or "UNKNOWN")
                 for r in rows}
 
-    # ── Monitor: EMA tracking and slow/timeout detection ────────────────
+    # ── Monitor: EMA tracking ────────────────────────────────────────────
 
     def _update_ema(self, owner_repo: str, job_name: str, now: int) -> None:
         """Update EMA for a job that completed successfully.
@@ -479,16 +461,7 @@ class Daemon:
         PR_CHANGED: any PR has mergeable=UNKNOWN (still computing after push)
         ACTIVE: any CI job QUEUED or IN_PROGRESS
         INACTIVE: neither condition
-
-        If a SIGUSR1 wake is pending, PR_CHANGED is preserved regardless
-        of other conditions (prevents race: wake scheduled during poll,
-        then overwritten by stale recalculation).
         """
-        # If a wake is pending, keep PR_CHANGED
-        if self._wake_event:
-            self.mode = ActivityMode.PR_CHANGED
-            return
-
         # Check for active CI
         rows = self.db.execute(
             "SELECT status FROM ci_events "

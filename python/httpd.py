@@ -153,8 +153,12 @@ class DaemonHandler(BaseHTTPRequestHandler):
         if not ok:
             self._json_error(504, f"poll failed: {err}")
             return
+        # Enter PR_CHANGED mode so caller gets immediate 30s polling
+        from daemon import ActivityMode
+        d.mode = ActivityMode.PR_CHANGED
         self._json_ok({
             "message": "poll completed",
+            "mode": d.mode.value,
             "last_synced": self._get_max_last_synced(),
         })
 

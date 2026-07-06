@@ -1,7 +1,7 @@
 """Post-push hook installer. Writes .git/hooks/post-push script.
 
-FR-34: Installed automatically by continuity register.
-FR-33: Sends SIGUSR1 to daemon on git push to origin.
+FR-45: Installed automatically by ci register.
+FR-46: Single cross-platform hook script — curl POST /poll.
 
 Public API:
     install(repo_path) → Path  (installed hook path)
@@ -15,15 +15,11 @@ from pathlib import Path
 
 
 HOOK_SCRIPT = """#!/bin/sh
-# continuity post-push hook — wakes daemon on push to origin
+# continuity post-push hook — wakes daemon on push to origin via HTTP RPC
 REMOTE=$1
 [ "$REMOTE" = "origin" ] || exit 0
-# Find the continuity daemon PID file
-PID_FILE="${CONTINUITY_HOME:-$HOME/.local/share/continuity}/daemon.pid"
-if [ -f "$PID_FILE" ]; then
-    PID=$(cat "$PID_FILE")
-    kill -SIGUSR1 "$PID" 2>/dev/null || true
-fi
+PORT=$(cat "${CONTINUITY_HOME:-$HOME/.local/share/continuity}/daemon.port" 2>/dev/null)
+[ -n "$PORT" ] && curl -s -X POST "http://localhost:$PORT/poll" >/dev/null 2>&1 &
 exit 0
 """
 
