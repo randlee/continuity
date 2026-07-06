@@ -109,15 +109,14 @@ def _activity_mode(db: sqlite3.Connection) -> str:
 
     if any(s in ACTIVE_STATUSES for (s,) in rows):
         return "ACTIVE"
-    if rows:
-        return "WATCHFUL"
 
-    open_count = db.execute(
-        "SELECT COUNT(*) FROM pull_requests WHERE state = ?", (PR_STATE_OPEN,)
+    unknown_count = db.execute(
+        "SELECT COUNT(*) FROM pull_requests "
+        "WHERE mergeable = 'UNKNOWN' AND state = 'OPEN'"
     ).fetchone()[0]
-    if open_count > 0:
-        return "WATCHFUL"
-    return "IDLE"
+    if unknown_count > 0:
+        return "PR_CHANGED"
+    return "INACTIVE"
 
 
 # ═══════════════════════════════════════════════════════════════════════════

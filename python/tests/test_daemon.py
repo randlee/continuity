@@ -211,21 +211,10 @@ class TestPollCycle:
 # ═══════════════════════════════════════════════════════════════════════════
 
 class TestAdaptiveMode:
-    def test_idle_when_no_prs(self, daemon_home, db_conn, mock_client):
+    def test_inactive_by_default(self, daemon_home, db_conn, mock_client):
         d = Daemon(daemon_home, {"test": mock_client}, db_conn)
         d._recalculate_mode()
-        assert d.mode == ActivityMode.IDLE
-
-    def test_watchful_when_open_prs_no_ci(self, daemon_home, db_conn, mock_client):
-        db_conn.execute(
-            "INSERT INTO pull_requests (owner_repo, pr_number, branch, state, updated_at) "
-            "VALUES ('test-owner/test-repo', 1, 'main', 'OPEN', 0)"
-        )
-        db_conn.commit()
-
-        d = Daemon(daemon_home, {"test": mock_client}, db_conn)
-        d._recalculate_mode()
-        assert d.mode == ActivityMode.WATCHFUL
+        assert d.mode == ActivityMode.INACTIVE
 
     def test_active_when_ci_running(self, daemon_home, db_conn, mock_client):
         db_conn.execute(
@@ -233,7 +222,6 @@ class TestAdaptiveMode:
             "VALUES ('test-owner/test-repo', 1, 'build', 'IN_PROGRESS', 0)"
         )
         db_conn.commit()
-
         d = Daemon(daemon_home, {"test": mock_client}, db_conn)
         d._recalculate_mode()
         assert d.mode == ActivityMode.ACTIVE
@@ -245,60 +233,56 @@ class TestAdaptiveMode:
             "VALUES ('test-owner/test-repo', 1, 'build', 'QUEUED', 0)"
         )
         db_conn.commit()
-
         d = Daemon(daemon_home, {"test": mock_client}, db_conn)
         d._recalculate_mode()
         assert d.mode == ActivityMode.ACTIVE
 
-    def test_transitions_watchful_to_active(self, daemon_home, db_conn, mock_client):
-        """Mode transitions from WATCHFUL to ACTIVE when CI starts."""
-        d = Daemon(daemon_home, {"test": mock_client}, db_conn)
-        d._recalculate_mode()
-        assert d.mode == ActivityMode.IDLE
-
-        # Open a PR → WATCHFUL
+    def test_pr_changed_when_unknown_mergeable(self, daemon_home, db_conn, mock_client):
+        """PR_CHANGED when any PR has mergeable=UNKNOWN."""
         db_conn.execute(
-            "INSERT INTO pull_requests (owner_repo, pr_number, branch, state, updated_at) "
-            "VALUES ('x/y', 1, 'main', 'OPEN', 0)"
+            "INSERT INTO pull_requests (owner_repo, pr_number, branch, state, mergeable, updated_at) "
+            "VALUES ('x/y', 1, 'main', 'OPEN', 'UNKNOWN', 0)"
         )
         db_conn.commit()
+        d = Daemon(daemon_home, {"test": mock_client}, db_conn)
         d._recalculate_mode()
-        assert d.mode == ActivityMode.WATCHFUL
+        assert d.mode == ActivityMode.PR_CHANGED
 
-        # CI starts → ACTIVE
+    def test_pr_changed_overrides_active(self, daemon_home, db_conn, mock_client):
+        """PR_CHANGED takes priority over ACTIVE when both conditions exist."""
         db_conn.execute(
             "INSERT INTO ci_events (owner_repo, pr_number, job_name, status, recorded_at) "
-            "VALUES ('x/y', 1, 'build', 'QUEUED', 0)"
+            "VALUES ('x/y', 1, 'build', 'IN_PROGRESS', 0)"
+        )
+        db_conn.execute(
+            "INSERT INTO pull_requests (owner_repo, pr_number, branch, state, mergeable, updated_at) "
+            "VALUES ('x/y', 2, 'feat', 'OPEN', 'UNKNOWN', 0)"
         )
         db_conn.commit()
+        d = Daemon(daemon_home, {"test": mock_client}, db_conn)
         d._recalculate_mode()
-        assert d.mode == ActivityMode.ACTIVE
+        assert d.mode == ActivityMode.PR_CHANGED
 
-    def test_transitions_active_to_idle(self, daemon_home, db_conn, mock_client):
-        """Mode transitions from ACTIVE to IDLE when CI completes and PR closes."""
+    def test_transitions_to_inactive_when_ci_completes(self, daemon_home, db_conn, mock_client):
+        """Mode transitions from ACTIVE to INACTIVE when CI completes."""
         db_conn.execute(
             "INSERT INTO ci_events (owner_repo, pr_number, job_name, status, recorded_at) "
             "VALUES ('x/y', 1, 'build', 'IN_PROGRESS', 0)"
         )
         db_conn.commit()
-
         d = Daemon(daemon_home, {"test": mock_client}, db_conn)
         d._recalculate_mode()
         assert d.mode == ActivityMode.ACTIVE
 
-        # CI completed → but PR still open → WATCHFUL
+        # CI completed → INACTIVE (no UNKNOWN, no active CI)
         db_conn.execute("DELETE FROM ci_events")
         db_conn.execute(
             "INSERT INTO ci_events (owner_repo, pr_number, job_name, status, recorded_at) "
             "VALUES ('x/y', 1, 'build', 'COMPLETED', 0)"
         )
-        db_conn.execute(
-            "INSERT INTO pull_requests (owner_repo, pr_number, branch, state, updated_at) "
-            "VALUES ('x/y', 1, 'main', 'OPEN', 0)"
-        )
         db_conn.commit()
         d._recalculate_mode()
-        assert d.mode == ActivityMode.WATCHFUL
+        assert d.mode == ActivityMode.INACTIVE
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -308,27 +292,27 @@ class TestAdaptiveMode:
 class TestRateLimitBackoff:
     def test_normal_interval(self, daemon_home, db_conn, mock_client):
         """Normal rate limit → standard interval."""
-        config = DaemonConfig(active_interval=30)
+        config = DaemonConfig(active_interval=300)
         d = Daemon(daemon_home, {"test": mock_client}, db_conn, config)
         d.mode = ActivityMode.ACTIVE
-        assert d._next_interval() == 30
+        assert d._next_interval() == 300
 
     def test_backoff_when_low(self, daemon_home, db_conn):
         """Rate limit below LOW_WATER → doubled interval."""
         c = MagicMock(spec=GhClient)
-        c.rate_limit = ApiUsage(remaining=100)  # below 500 LOW_WATER
-        config = DaemonConfig(active_interval=30, low_water=500)
+        c.rate_limit = ApiUsage(remaining=500)  # below 1000 LOW_WATER
+        config = DaemonConfig(active_interval=300, low_water=1000)
         d = Daemon(daemon_home, {"test": c}, db_conn, config)
         d.mode = ActivityMode.ACTIVE
-        assert d._next_interval() == 60  # doubled
+        assert d._next_interval() == 600  # doubled
 
     def test_backoff_capped(self, daemon_home, db_conn):
         """Backoff capped at max_backoff."""
         c = MagicMock(spec=GhClient)
         c.rate_limit = ApiUsage(remaining=10)
-        config = DaemonConfig(active_interval=30, low_water=500, max_backoff=120)
+        config = DaemonConfig(pr_changed_interval=30, low_water=1000, max_backoff=120)
         d = Daemon(daemon_home, {"test": c}, db_conn, config)
-        d.mode = ActivityMode.ACTIVE
+        d.mode = ActivityMode.PR_CHANGED
         assert d._next_interval() == 60  # 30*2 = 60, under cap of 120
 
     def test_min_rate_limit_across_clients(self, daemon_home, db_conn):
@@ -337,7 +321,7 @@ class TestRateLimitBackoff:
         c1.rate_limit = ApiUsage(remaining=100)
         c2 = MagicMock(spec=GhClient)
         c2.rate_limit = ApiUsage(remaining=4000)
-        config = DaemonConfig(low_water=500)
+        config = DaemonConfig(low_water=1000)
         d = Daemon(daemon_home, {"a": c1, "b": c2}, db_conn, config)
         assert d._min_rate_limit_remaining() == 100
 
@@ -348,18 +332,11 @@ class TestRateLimitBackoff:
 
 class TestAdr:
     def test_FR31_adaptive_modes(self, daemon_home, db_conn, mock_client):
-        """FR-31: ACTIVE/WATCHFUL/IDLE modes."""
+        """FR-31: PR_CHANGED/ACTIVE/INACTIVE modes."""
         d = Daemon(daemon_home, {"test": mock_client}, db_conn)
-        assert d.mode == ActivityMode.IDLE
+        assert d.mode == ActivityMode.INACTIVE
 
-        db_conn.execute(
-            "INSERT INTO pull_requests (owner_repo, pr_number, branch, state, updated_at) "
-            "VALUES ('x/y', 1, 'main', 'OPEN', 0)"
-        )
-        db_conn.commit()
-        d._recalculate_mode()
-        assert d.mode == ActivityMode.WATCHFUL
-
+        # CI starts → ACTIVE
         db_conn.execute(
             "INSERT INTO ci_events (owner_repo, pr_number, job_name, status, recorded_at) "
             "VALUES ('x/y', 1, 'build', 'IN_PROGRESS', 0)"
@@ -367,6 +344,15 @@ class TestAdr:
         db_conn.commit()
         d._recalculate_mode()
         assert d.mode == ActivityMode.ACTIVE
+
+        # Add UNKNOWN mergeable → PR_CHANGED (overrides ACTIVE)
+        db_conn.execute(
+            "INSERT INTO pull_requests (owner_repo, pr_number, branch, state, mergeable, updated_at) "
+            "VALUES ('x/y', 2, 'feat', 'OPEN', 'UNKNOWN', 0)"
+        )
+        db_conn.commit()
+        d._recalculate_mode()
+        assert d.mode == ActivityMode.PR_CHANGED
 
     def test_FR32_mode_recalculated(self, daemon_home, db_conn, mock_client):
         """FR-32: Mode re-evaluated after each poll cycle."""
@@ -374,25 +360,23 @@ class TestAdr:
         d._recalculate_mode()
         initial = d.mode
 
-        # Add data
         db_conn.execute(
             "INSERT INTO ci_events (owner_repo, pr_number, job_name, status, recorded_at) "
-            "VALUES ('x/y', 1, 'build', 'IN_PROGRESS', 0)"
+            "VALUES ('x/y', 1, 'build', 'QUEUED', 0)"
         )
         db_conn.commit()
         d._recalculate_mode()
-        assert d.mode != initial  # mode changed
+        assert d.mode != initial
         assert d.mode == ActivityMode.ACTIVE
 
     def test_FR36_rate_limit_backoff(self, daemon_home, db_conn):
         """FR-36: Interval increases when rate limit is low."""
         c = MagicMock(spec=GhClient)
         c.rate_limit = ApiUsage(remaining=100)
-        config = DaemonConfig(active_interval=30, low_water=500)
-
+        config = DaemonConfig(active_interval=300, low_water=1000)
         d = Daemon(daemon_home, {"test": c}, db_conn, config)
         d.mode = ActivityMode.ACTIVE
-        assert d._next_interval() > 30  # backoff applied
+        assert d._next_interval() > 300  # backoff applied
 
 
 # ═══════════════════════════════════════════════════════════════════════════

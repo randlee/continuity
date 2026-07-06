@@ -43,18 +43,19 @@ from constants import (
 # ═══════════════════════════════════════════════════════════════════════════
 
 class ActivityMode(Enum):
-    ACTIVE = "ACTIVE"       # CI running: 30s interval
-    WATCHFUL = "WATCHFUL"   # Open PRs, no CI: 5min interval
-    IDLE = "IDLE"           # No open PRs: 30min interval
+    PR_CHANGED = "PR_CHANGED"  # post-push inspection: 30s
+    ACTIVE = "ACTIVE"          # CI running: 5 min
+    INACTIVE = "INACTIVE"      # nothing happening: 20 min
 
 
 @dataclass
 class DaemonConfig:
-    active_interval: int = 30
-    watchful_interval: int = 300
-    idle_interval: int = 1800
-    low_water: int = 500          # rate limit remaining threshold
-    max_backoff: int = 3600       # max interval when rate limited
+    pr_changed_interval: int = 30
+    active_interval: int = 300           # 5 min (ADR-21)
+    inactive_interval: int = 1200         # 20 min
+    post_push_delay: int = 60             # 1 min (ADR-20)
+    low_water: int = 1000                 # rate limit remaining threshold
+    max_backoff: int = 3600               # max interval when rate limited
     backoff_multiplier: float = 2.0
 
 
@@ -76,10 +77,11 @@ class Daemon:
         self.clients = clients
         self.db = db
         self.config = config or DaemonConfig()
-        self.mode = ActivityMode.IDLE
+        self.mode = ActivityMode.INACTIVE
         self._lock_dir = self.home / "daemon.lock"
         self._shutdown_flag = False
         self._wake_event = False
+        self._scheduled_wake_at: float = 0.0
         self._pid_file = self.home / "daemon.pid"
         # Monitor state: EMA tracking per (repo, job_name)
         self._ema: dict[tuple[str, str], float] = {}
@@ -106,7 +108,16 @@ class Daemon:
         self._shutdown_flag = True
 
     def _wake(self, signum=None, frame=None):
-        """SIGUSR1 handler. Wakes daemon for immediate poll."""
+        """SIGUSR1 handler. Schedules delayed poll for PR_CHANGED inspection.
+
+        ADR-20: POST_PUSH_DELAY = 1 min. GitHub takes ~1 min to compute
+        is_mergeable after a push. The first SIGUSR1 sets the wake time;
+        subsequent signals within the delay window are ignored (first-wins).
+        """
+        now = time.time()
+        if self._wake_event and self._scheduled_wake_at > now:
+            return  # first-wins: already scheduled, ignore
+        self._scheduled_wake_at = now + self.config.post_push_delay
         self._wake_event = True
 
     # ── Singleton guard ──────────────────────────────────────────────────
@@ -166,16 +177,27 @@ class Daemon:
                 break
 
             self._wake_event = False
+            self._scheduled_wake_at = 0.0
             self._poll_cycle()
             self._recalculate_mode()
 
+
     def _sleep_interruptible(self, seconds: float):
-        """Sleep, but wake on SIGUSR1 or shutdown."""
+        """Sleep until seconds elapsed, scheduled wake, or shutdown."""
         deadline = time.time() + seconds
         while time.time() < deadline:
-            if self._shutdown_flag or self._wake_event:
+            if self._shutdown_flag:
                 return
-            time.sleep(min(0.5, deadline - time.time()))
+            if self._wake_event and time.time() >= self._scheduled_wake_at:
+                return
+            remaining = min(
+                deadline - time.time(),
+                self._scheduled_wake_at - time.time() if self._wake_event else 999,
+                0.5,
+            )
+            if remaining <= 0:
+                return
+            time.sleep(min(remaining, 0.5))
 
     # ── Poll cycle ───────────────────────────────────────────────────────
 
@@ -204,10 +226,6 @@ class Daemon:
             notify_events.extend(events)
 
         self.db.commit()
-
-        # Check monitor for slow/timeout jobs
-        monitor_events = self._check_monitor(now)
-        notify_events.extend(monitor_events)
 
         # Dispatch notifications in a spawned thread (non-blocking)
         if notify_events:
@@ -471,9 +489,9 @@ class Daemon:
     def _next_interval(self) -> int:
         """Calculate next poll interval based on mode and rate limits."""
         base = {
+            ActivityMode.PR_CHANGED: self.config.pr_changed_interval,
             ActivityMode.ACTIVE: self.config.active_interval,
-            ActivityMode.WATCHFUL: self.config.watchful_interval,
-            ActivityMode.IDLE: self.config.idle_interval,
+            ActivityMode.INACTIVE: self.config.inactive_interval,
         }[self.mode]
 
         # FR-36: Rate limit backoff
@@ -491,34 +509,33 @@ class Daemon:
         return min(limits) if limits else 5000
 
     def _recalculate_mode(self):
-        """FR-32: Re-evaluate activity mode after each poll cycle."""
-        has_active_ci = False
-        has_open_prs = False
+        """FR-32: Re-evaluate activity mode after each poll cycle.
 
+        PR_CHANGED: any PR has mergeable=UNKNOWN (still computing after push)
+        ACTIVE: any CI job QUEUED or IN_PROGRESS
+        INACTIVE: neither condition
+        """
+        # Check for active CI
         rows = self.db.execute(
             "SELECT status FROM ci_events "
             "GROUP BY owner_repo, pr_number, job_name "
             "HAVING recorded_at = MAX(recorded_at)"
         ).fetchall()
 
-        for (status,) in rows:
-            if status in ACTIVE_STATUSES:
-                has_active_ci = True
-            has_open_prs = True
+        has_active_ci = any(status in ACTIVE_STATUSES for (status,) in rows)
 
-        if not rows:
-            # Also check pull_requests for open PRs
-            open_count = self.db.execute(
-                "SELECT COUNT(*) FROM pull_requests WHERE state = 'OPEN'"
-            ).fetchone()[0]
-            has_open_prs = open_count > 0
+        # Check for UNKNOWN mergeable states (post-push, still computing)
+        unknown_count = self.db.execute(
+            "SELECT COUNT(*) FROM pull_requests "
+            "WHERE mergeable = 'UNKNOWN' AND state = 'OPEN'"
+        ).fetchone()[0]
 
-        if has_active_ci:
+        if unknown_count > 0:
+            self.mode = ActivityMode.PR_CHANGED
+        elif has_active_ci:
             self.mode = ActivityMode.ACTIVE
-        elif has_open_prs:
-            self.mode = ActivityMode.WATCHFUL
         else:
-            self.mode = ActivityMode.IDLE
+            self.mode = ActivityMode.INACTIVE
 
 
 # ═══════════════════════════════════════════════════════════════════════════

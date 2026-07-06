@@ -123,10 +123,11 @@ Depends on `gh/client`, `diff`, `db`. Testable with mocked `GhClient`.
 
 | ID | Requirement |
 |---|---|
-| FR-31 | ACTIVE (30s), WATCHFUL (5m), IDLE (30m) adaptive modes |
+| FR-31 | PR_CHANGED (30s), ACTIVE (5 min), INACTIVE (20 min) adaptive modes |
+| FR-31a | POST_PUSH_DELAY: SIGUSR1 schedules first PR_CHANGED poll at now + 1 min, not immediately. First-wins: multiple signals within window do not push further |
 | FR-32 | Mode re-evaluated after each poll cycle |
-| FR-33 | SIGUSR1 triggers immediate unscheduled poll |
-| FR-36 | If rate limit remaining < LOW_WATER, increase interval regardless of mode |
+| FR-33 | `continuity register` adds repo + installs post-push hook |
+| FR-36 | If rate limit remaining < LOW_WATER (1,000), double the current mode's interval regardless of mode. Restore to default when remaining recovers |
 | FR-43 | `continuity register` adds repo + installs post-push hook |
 
 **Singleton guarantees** (see Architecture §11):
@@ -160,7 +161,8 @@ Pure function. No I/O.
 | ID | Requirement |
 |---|---|
 | FR-31 | `next_interval(mode, rate_limit_remaining)` → seconds |
-| FR-36 | Rate limit backoff: double interval when remaining < LOW_WATER, up to cap |
+| FR-31b | PR_CHANGED = 30s, ACTIVE = 5 min (300s), INACTIVE = 20 min (1200s) |
+| FR-36 | Rate limit backoff: when remaining < LOW_WATER (1,000), double the current mode's interval. Restore to mode default when remaining recovers above threshold |
 
 ### Non-Functional
 

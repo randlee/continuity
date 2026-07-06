@@ -118,15 +118,52 @@ WAL mode for concurrent reads (CLI) and writes (daemon/interceptor).
 
 The poll daemon operates in three modes, re-evaluated after each cycle:
 
-| Mode | Condition | Interval |
-|---|---|---|
-| ACTIVE | Any PR has a job in QUEUED or IN_PROGRESS | 30s |
-| WATCHFUL | Open PRs exist but no CI running | 5 min |
-| IDLE | No open PRs across any registered repo | 30 min |
+| Mode | Interval | Entry | Exit |
+|---|---|---|---|
+| PR_CHANGED | 30s | SIGUSR1 (push or PR create) | `is_mergeable` ≠ UNKNOWN |
+| ACTIVE | 5 min | CI job QUEUED or IN_PROGRESS | All CI jobs complete |
+| INACTIVE | 20 min | No CI, no recent push | SIGUSR1 → PR_CHANGED |
 
-SIGUSR1 from a post-push hook triggers an immediate poll and transitions to
-ACTIVE if new CI is detected. Rate limit pressure overrides mode — if
-remaining points fall below threshold the interval increases regardless.
+**PR_CHANGED (30s):** The critical post-push inspection window. Entered
+immediately on SIGUSR1 from a post-push hook or PR create event. Exits
+when GitHub has computed the mergeable state (no longer UNKNOWN). This
+replaces the previous ACTIVE=30s mode — the old 30s interval was too
+aggressive for CI monitoring (minutes-long runs) but too slow for the
+post-push mergeability check (seconds matter).
+
+**POST_PUSH_DELAY = 1 min (ADR-20):** On SIGUSR1, the daemon does not
+poll immediately. It schedules the first PR_CHANGED poll at `now + 1 min`.
+GitHub takes approximately 1 minute to compute `is_mergeable` after a
+push. Polling immediately returns UNKNOWN reliably. The 1-minute delay
+gives high confidence of getting the computed state on the first try.
+Multiple SIGUSR1 within the delay window: first-wins — subsequent signals
+do not push the scheduled poll further out.
+
+**ACTIVE = 5 min (ADR-21):** The original ACTIVE=30s was too aggressive.
+CI runs take minutes; 30s provides no useful new information for most of
+the run. PR_CHANGED at 30s handles the critical post-push window. ACTIVE
+at 5 min provides reasonable status cadence without wasting API budget.
+
+**INACTIVE = 20 min:** No CI running, no recent push. This is not "no
+open PRs" — open PRs can exist. It simply means nothing is happening
+right now. SIGUSR1 from a post-push hook immediately transitions to
+PR_CHANGED.
+
+**CLI cache:** If `last_polled_at` is within 30s of now, `continuity
+status` and similar read commands return SQLite state without an API
+call. If ≥ 30s, execute a GraphQL query and reset the poll timer.
+
+### Rate Limit Model
+
+- **Primary limit:** 5,000 points/hour per authenticated user (independent
+  per account)
+- **LOW_WATER = 1,000 remaining:** When `rateLimit.remaining < 1000`,
+  double the current mode's interval. Restore to mode default when
+  remaining recovers above the threshold
+- **Typical burn:** ~425 points/hour at a realistic mix of modes — well
+  within budget
+- **Action on first run:** Log `rateLimit.cost` from each response
+  prominently to calibrate actual cost; tune LOW_WATER if needed
 
 ## 7. Data Model
 
@@ -333,7 +370,9 @@ def daemon():
 | Append-only ci_events | Immutable audit log. Current state is derivable. No UPDATE logic. |
 | GraphQL batch query per account | One API call covers all repos and all PRs. O(accounts), not O(repos). |
 | Persistent daemon | Holds tokens in memory. Eliminates per-poll auth subprocess overhead. |
-| Adaptive poll interval | Conserves API tokens when idle. ACTIVE/WATCHFUL/IDLE modes. |
+| Adaptive poll interval | Conserves API tokens. Three modes: PR_CHANGED (30s post-push), ACTIVE (5 min CI running), INACTIVE (20 min no activity) |
+| POST_PUSH_DELAY (ADR-20) | GitHub takes ~1 min to compute is_mergeable. Delay first poll after push to avoid UNKNOWN. First-wins: multiple signals within window don't push further |
+| ACTIVE=5 min (ADR-21) | 30s was too aggressive for CI monitoring. PR_CHANGED handles the critical post-push window at 30s. ACTIVE at 5 min provides reasonable cadence |
 | SQLite (not Postgres/MySQL) | Single binary, no server. WAL mode for concurrent reads. |
 | CLI reads SQLite only | Status is always instant. No API calls on the read path. |
 | Three-source architecture | Interception + polling + structured log. Each adds data without replacing the others. |
