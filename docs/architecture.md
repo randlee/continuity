@@ -100,13 +100,22 @@ PR_CHANGED entry without waiting for the next scheduled poll.
 
 ### 5.2 Poll Daemon (Phase 3+)
 
-A persistent daemon that polls GitHub GraphQL on an adaptive interval.
+A persistent daemon that polls GitHub GraphQL on per-repo adaptive intervals.
 
 **Lifecycle:**
-1. Startup: open SQLite, authenticate via `gh auth token` (tokens in memory only)
-2. Loop: sleep → query all repos per account → diff against SQLite → record
-   changes → re-evaluate interval
-3. Shutdown: SIGTERM graceful exit. Wake: HTTP `POST /poll` (see §12).
+1. Startup: open SQLite connections (see §5.4), authenticate via `gh auth token`
+   (tokens in memory only). Start HTTP RPC server.
+2. Loop: compute `sleep = min(all_repo_next_poll_at) - now`. Sleep until
+   `sleep` elapses or shutdown. Wake and poll ONLY the repos whose timers
+   have expired. Diff against SQLite. Write changes. Recalculate each
+   polled repo's timer independently.
+3. Shutdown: SIGTERM graceful exit. Wake: HTTP `POST /poll` for a specific
+   repo (see §12) resets that repo's timer to `now`.
+
+**Per-repo timer model** (§6): Each `owner/repo` owns its interval,
+recalculated independently after each poll. A push to `foo` resets foo's
+timer to 30s without affecting `bar`'s 20 min interval. The sleep loop
+picks the minimum; only due repos are polled.
 
 **State diffing:** Incoming job states are compared against the latest
 `ci_events` row per (repo, PR, job). A new row is inserted only when status
@@ -117,53 +126,141 @@ or conclusion differs. This prevents the event log from becoming a heartbeat.
 Single database at `~/.local/share/continuity/continuity.db`.
 Override: `CONTINUITY_DB` environment variable.
 
-WAL mode for concurrent reads (CLI) and writes (daemon/interceptor).
+**Write model:** Only the daemon's poll thread writes to SQLite. Every other
+component (HTTPD handlers, notification dispatch threads, interceptor
+processes) opens its own read-only connection in WAL mode. No
+`check_same_thread=False` — each thread owns its connection. Write
+serialization is implicit: only the poll thread writes, so no lock is needed
+for SQLite access.
 
-## 6. Activity Modes
+**Connection lifecycle:**
+- **Writer connection:** Owned by the daemon's poll thread. Created at
+  startup via `ensure_db()`. Never shared.
+- **HTTPD read connections:** Created per-request by the HTTP handler
+  (short-lived). Reads via WAL are non-blocking.
+- **Interceptor writes:** The interceptor is a separate process with its
+  own connection. WAL mode handles concurrent process access natively —
+  no coordination needed between daemon and interceptor.
+- **Notification thread:** Opens its own read connection. The daemon
+  commits before dispatching notifications — the notification thread
+  always sees committed state.
 
-The poll daemon operates in three modes, re-evaluated after each cycle:
+**WAL mode** for concurrent reads across threads and processes. SQLite
+handles reader-writer concurrency natively in WAL mode: readers see a
+consistent snapshot from the start of their transaction, writers append
+to the WAL without blocking readers.
 
-| Mode | Interval | Entry | Exit |
-|---|---|---|---|
-| PR_CHANGED | 30s | Daemon wake (push or PR create) | `is_mergeable` ≠ UNKNOWN |
-| ACTIVE | 5 min | CI job QUEUED or IN_PROGRESS | All CI jobs complete |
-| INACTIVE | 20 min | No CI, no recent push | Daemon wake → PR_CHANGED |
+## 6. Per-Repo Timer Model
 
-**Daemon wake mechanism:** `POST /poll` on the HTTP RPC server (see §12)
-immediately transitions the daemon to PR_CHANGED mode. The 30s poll interval
-handles timing naturally — the first poll may return UNKNOWN (GitHub can
-take up to ~60s to compute mergeability after a push), but the second poll
-30s later catches it. No separate delay timer is needed; the mode's own
-interval is the pacing mechanism.
+The daemon uses per-repo timers instead of a single global polling mode.
+Each `owner/repo` tracks its own `next_poll_at` timestamp and re-evaluates
+its interval independently after every poll.
 
-**PR_CHANGED (30s):** The critical post-push inspection window. Entered
-immediately on daemon wake from a post-push hook or PR create event. Exits
-when GitHub has computed the mergeable state (no longer UNKNOWN).
+### 6.1 Why Per-Repo
 
-**ACTIVE = 5 min (ADR-21):** The original ACTIVE=30s was too aggressive.
-CI runs take minutes; 30s provides no useful new information for most of
-the run. PR_CHANGED at 30s handles the critical post-push window. ACTIVE
-at 5 min provides reasonable status cadence without wasting API budget.
+The old global mode model (PR_CHANGED/ACTIVE/INACTIVE) applied a single
+interval to ALL repos. A push to `randlee/foo` forced every repo under
+every account to poll at 30s. This burned API tokens on repos that hadn't
+changed. Per-repo timers isolate the blast radius: a push to `foo` resets
+only `foo`'s timer; `rand-lee/bar` continues at its 20 min interval.
 
-**INACTIVE = 20 min:** No CI running, no recent push. This is not "no
-open PRs" — open PRs can exist. It simply means nothing is happening
-right now. A daemon wake immediately transitions to PR_CHANGED.
+### 6.2 Timer States
 
-**CLI cache:** The HTTPD handler checks `last_synced` staleness internally.
-If data is fresh (< 30s), the response returns immediately from SQLite.
-If stale, the handler triggers an on-demand GraphQL poll before responding.
+Each repo's timer is recalculated after its poll cycle based on the repo's
+current state:
 
-### Rate Limit Model
+| State | Interval | Condition |
+|---|---|---|
+| PR_CHANGED | 30s | Any PR has `mergeable = UNKNOWN` (post-push, still computing) |
+| ACTIVE | 5 min | Any PR has a CI job in QUEUED or IN_PROGRESS |
+| INACTIVE | 20 min | No UNKNOWN mergeable, no active CI (open PRs may exist) |
 
-- **Primary limit:** 5,000 points/hour per authenticated user (independent
-  per account)
-- **LOW_WATER = 1,000 remaining:** When `rateLimit.remaining < 1000`,
-  double the current mode's interval. Restore to mode default when
-  remaining recovers above the threshold
-- **Typical burn:** ~425 points/hour at a realistic mix of modes — well
-  within budget
-- **Action on first run:** Log `rateLimit.cost` from each response
-  prominently to calibrate actual cost; tune LOW_WATER if needed
+A repo in ACTIVE state with CI running AND UNKNOWN mergeable (push
+landed while CI was running) stays at 30s (PR_CHANGED wins — shortest
+interval always applies).
+
+### 6.3 Timer Reset
+
+A repo's timer is reset to `now` (immediate poll) when:
+
+1. **Interceptor detects `gh pr create`** → `POST /poll?repo=owner/repo`
+2. **Post-push hook fires** → `POST /poll?repo=owner/repo`
+3. **Manual `ci poll <repo>`** → `POST /poll?repo=owner/repo`
+
+Resetting to `now` means the daemon's next sleep boundary polls that repo
+immediately. The repo then runs its first poll at PR_CHANGED (30s for
+subsequent polls) to handle the mergeability computation window.
+
+### 6.4 Poll Loop Algorithm
+
+```python
+class Daemon:
+    _timers: dict[str, float]  # owner_repo → next_poll_at (unix timestamp)
+
+    def _run_loop(self):
+        while not self._shutdown_flag:
+            now = time.time()
+            due = [repo for repo, next_at in self._timers.items()
+                   if now >= next_at]
+
+            if not due:
+                sleep = min(self._timers.values()) - now
+                time.sleep(max(sleep, 0.5))
+                continue
+
+            for repo in due:
+                self._poll_repo(repo)
+                self._recalculate_timer(repo)
+```
+
+**Key properties:**
+- Only repos whose timers have expired are polled. Polling one repo does
+  not poll other repos under the same account — each repo gets its own
+  GraphQL query or is batched efficiently with other due repos under the
+  same account.
+- `min(self._timers.values())` is O(n) but n is small (dozens of repos,
+  not thousands). Premature optimization.
+- The sleep checks the shutdown flag every 0.5s for responsiveness.
+
+### 6.5 Account Batching
+
+When multiple repos under the same account are due simultaneously, they
+are batched into a single GraphQL query (as today). The batching is
+opportunistic — repos under different accounts are polled sequentially.
+
+```python
+def _poll_cycle(self):
+    now = time.time()
+    due = [r for r, t in self._timers.items() if now >= t]
+    by_account = group_by_account(due)
+
+    for account, repos in by_account.items():
+        result = self.clients[account].poll(repos)
+        for owner_repo in repos:
+            self._apply_result_for_repo(owner_repo, result)
+            self._recalculate_timer(owner_repo)
+```
+
+### 6.6 Rate Limit Per Account
+
+Rate limit tracking is per-account, not per-repo. When
+`rateLimit.remaining < LOW_WATER` for an account, ALL repos under that
+account double their interval regardless of their individual state.
+When remaining recovers, each repo returns to its state-determined
+interval.
+
+| Condition | Effect |
+|---|---|
+| `remaining < LOW_WATER` (1,000) | All repos under account: interval × 2 |
+| `remaining < LOW_WATER / 2` | All repos under account: interval × 4 |
+| `remaining` recovers above threshold | Restore to per-repo state interval |
+
+### 6.7 Timer Persistence
+
+Timers are NOT persisted across daemon restarts. On startup, all repos
+default to PR_CHANGED (30s) for the first poll, then recalculate after
+that poll. This is safe: a restart means the daemon was down and may have
+missed events — aggressive initial polling is the conservative choice.
 
 ## 7. Data Model
 
@@ -296,8 +393,9 @@ Read path is non-critical — a slow dashboard load does not block
 
 ### 9.3 Post-Push Hook
 
-Installed by `continuity register`. Single cross-platform script — `curl`
-to the daemon's HTTP RPC `/poll` endpoint. Port discovered from
+Installed by `continuity register`. Single cross-platform script —
+`curl` to the daemon's HTTP RPC `/poll` endpoint with `?repo=` query
+param targeting the specific repo. Port discovered from
 `$CONTINUITY_HOME/daemon.port` (written at startup).
 
 **Unix:**
@@ -306,7 +404,8 @@ to the daemon's HTTP RPC `/poll` endpoint. Port discovered from
 # .git/hooks/post-push
 [ "$1" = "origin" ] || exit 0
 PORT=$(cat "$CONTINUITY_HOME/daemon.port" 2>/dev/null)
-curl -s -X POST "http://localhost:$PORT/poll" >/dev/null 2>&1 &
+REPO=$(git remote get-url origin | sed 's|.*[:/]\([^/]*/[^/]*\)\.git|\1|')
+curl -s -X POST "http://localhost:$PORT/poll?repo=$REPO" >/dev/null 2>&1 &
 ```
 
 **Windows:**
@@ -318,7 +417,7 @@ set /p PORT=<"%CONTINUITY_HOME%\daemon.port"
 curl -s -X POST http://localhost:%PORT%/poll >nul 2>&1
 ```
 
-Single wake path, cross-platform, debuggable.
+Single wake path, per-repo targeting, cross-platform, debuggable.
 
 ## 10. Auth Model
 
@@ -386,16 +485,25 @@ all data access.
 
 | Method | Path | Description |
 |---|---|---|
-| `GET` | `/status` | Daemon mode, rate limits, repo count, last synced |
+| `GET` | `/status` | Daemon state, rate limits, repo count, timers |
 | `GET` | `/prs` | All open PRs with current CI job states |
 | `GET` | `/prs/<owner>/<repo>/<num>` | Single PR detail + ci_events log |
-| `POST` | `/poll` | Trigger immediate poll cycle, return fresh data |
+| `POST` | `/poll` | Trigger immediate poll for a specific repo |
+| `POST` | `/poll?repo=owner/repo` | Reset specific repo's timer to now |
 
-### 12.2 Wake-on-Create
+### 12.2 Per-Repo Wake
 
-The interceptor calls `POST /poll` after logging a `gh pr create` event.
-This immediately transitions the daemon to PR_CHANGED mode so the new PR
-gets 30s polling without waiting for the next scheduled cycle.
+The `POST /poll` endpoint accepts an optional `?repo=owner/repo` query
+parameter. When provided, only that repo's timer is reset to `now` —
+the daemon polls it on the next sleep boundary. When omitted (`POST /poll`
+with no query param), all repos are polled (useful for manual `ci poll`).
+
+**Wake sources:**
+- **Interceptor (gh pr create):** `POST /poll?repo=owner/repo` → resets
+  only the new PR's repo
+- **Post-push hook:** `POST /poll?repo=owner/repo` → resets only the
+  pushed repo (see §9.3 for repo detection in hook)
+- **Manual `ci poll`:** `POST /poll` (no repo) → polls all repos
 
 ### 12.3 Port Discovery
 
@@ -410,14 +518,16 @@ The daemon owns cache staleness logic: stale data triggers an on-demand
 poll; fresh data returns immediately.
 
 **Design rationale:**
-- **Single writer**: Only the daemon writes to SQLite. Eliminates WAL
-  contention and stale-read edge cases.
+- **Single writer**: Only the daemon's poll thread writes to SQLite.
+  Eliminates WAL contention and stale-read edge cases.
 - **Cross-platform**: HTTP works everywhere. No signal imports, no
   platform-specific hooks.
 - **Debuggable**: `POST /poll` returns JSON with poll outcome and
   rate-limit info.
 - **Unified wake**: Interceptor, post-push hook, and manual `ci poll`
-  all use the same `POST /poll` endpoint.
+  all use the same `POST /poll` endpoint with optional repo targeting.
+- **Isolated blast radius**: A push to `foo` resets only `foo`'s timer.
+  Repos under idle accounts are unaffected.
 
 ## 13. Key Design Decisions
 
@@ -427,31 +537,132 @@ poll; fresh data returns immediately.
 | Append-only ci_events | Immutable audit log. Current state is derivable. No UPDATE logic. |
 | GraphQL batch query per account | One API call covers all repos and all PRs. O(accounts), not O(repos). |
 | Persistent daemon | Holds tokens in memory. Eliminates per-poll auth subprocess overhead. |
-| Adaptive poll interval | Conserves API tokens. Three modes: PR_CHANGED (30s post-push), ACTIVE (5 min CI running), INACTIVE (20 min no activity) |
-| ACTIVE=5 min (ADR-21) | 30s was too aggressive for CI monitoring. PR_CHANGED handles the critical post-push window at 30s. ACTIVE at 5 min provides reasonable cadence |
-| SQLite (not Postgres/MySQL) | Single binary, no server. WAL mode for concurrent reads. |
+| Per-repo adaptive poll intervals | Each repo owns its timer, independently recalculated. Isolates blast radius — a push to `foo` doesn't accelerate `bar`'s polling. Replaces global mode model (ADR-22). |
+| ACTIVE=5 min (ADR-21) | 30s was too aggressive for CI monitoring. PR_CHANGED handles the critical post-push window at 30s. ACTIVE at 5 min provides reasonable cadence. |
+| SQLite (not Postgres/MySQL) | Single binary, no server. WAL mode for concurrent reads. Single writer thread — no lock needed. |
 | CLI as HTTP thin client | All CLI commands read via daemon HTTP RPC. Daemon owns data access and cache staleness. Cross-platform, debuggable, single-writer. Replaces direct SQLite reads. |
-| Wake via `POST /poll` | Single wake path for hook, interceptor, and manual `ci poll`. HTTP works everywhere, returns acknowledgement. No SIGUSR1, no platform branches. |
+| Per-repo wake via `POST /poll?repo=` | Single wake path for hook, interceptor, and manual `ci poll`. HTTP works everywhere, returns acknowledgement. No SIGUSR1, no platform branches. Isolated to target repo. |
+| Single writer thread | Only the daemon's poll thread writes to SQLite. Notification, HTTPD, and interceptor threads open their own read connections. Eliminates `check_same_thread=False` hack. |
 | Three-source architecture | Interception + polling + structured log. Each adds data without replacing the others. |
 
-## 14. Remaining Implementation Tasks
+## 14. Rust Migration Path
+
+The Python POC is structured with module boundaries that map directly to
+Rust traits and crates under `sc-runtime`.
+
+### 14.1 Module → Trait Mapping
+
+| Python Module | Rust Equivalent | sc-runtime Integration |
+|---|---|---|
+| `gh/client.py` | `GhClient` trait | sc-runtime HTTP client + retry |
+| `diff.py` | Pure functions, `fn diff_jobs(...) -> Vec<CiEvent>` | No runtime dependency (pure) |
+| `daemon.py` | `PollOrchestrator` struct | sc-runtime shutdown, SQLite pool, config |
+| `httpd.py` | `axum::Router` or `warp::Filter` | sc-runtime shutdown integration |
+| `notify.py` | `Notify` trait | Optional: sc-runtime spawn for async dispatch |
+| `atm.py` | `AtmNotifier` impl `Notify` trait | — |
+| `db.py` | `rusqlite::Connection` + migrations | sc-runtime connection pool |
+| `monitor.py` | `EmaTracker` struct | No runtime dependency |
+| `constants.py` | `const` module | — |
+| `interceptor` | Standalone binary (same pattern) | — |
+
+### 14.2 Per-Repo Timer in Rust
+
+The per-repo timer model maps cleanly to `tokio`:
+
+```rust
+use std::collections::HashMap;
+use tokio::time::{sleep_until, Instant};
+
+struct PollScheduler {
+    timers: HashMap<String, Instant>,  // owner_repo → next poll time
+    shutdown: watch::Receiver<bool>,   // from sc-runtime
+}
+
+impl PollScheduler {
+    async fn run(&mut self) {
+        loop {
+            tokio::select! {
+                _ = shutdown.changed() => break,
+                _ = self.sleep_until_next() => {},
+            }
+            self.poll_due_repos().await;
+        }
+    }
+
+    async fn sleep_until_next(&self) {
+        if let Some(next) = self.timers.values().min() {
+            sleep_until(*next).await;
+        }
+    }
+
+    fn reset_timer(&mut self, repo: &str) {
+        self.timers.insert(repo.into(), Instant::now());
+    }
+}
+```
+
+### 14.3 SQLite Connection Model in Rust
+
+```rust
+use rusqlite::Connection;
+use std::sync::{Arc, Mutex};
+
+// Writer: owned exclusively by the poll thread
+let writer: Connection = Connection::open(db_path)?;
+writer.execute_batch("PRAGMA journal_mode=WAL")?;
+
+// Reader pool: per-thread connections, created on demand
+fn open_reader() -> Connection {
+    let conn = Connection::open(db_path).unwrap();
+    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA query_only=ON").unwrap();
+    conn
+}
+
+// Alternatively: Mutex<Connection> if single-writer-thread is guaranteed.
+// rusqlite::Connection is Send but not Sync — move, don't share.
+```
+
+**Key constraint:** `rusqlite::Connection` is `Send` but not `Sync`.
+You can move it to another thread, but you can't share a `&Connection`
+across threads. The Python POC's single-writer-thread model avoids this
+entirely: the writer connection stays in the poll thread forever. Readers
+open their own connections. This is the simplest correct model and ports
+directly to Rust.
+
+### 14.4 Migration Order
+
+| Order | Component | Rationale |
+|---|---|---|
+| 1 | `sc-runtime` (db, shutdown, retry, config) | Foundation — everything depends on it |
+| 2 | `diff` + `constants` | Pure, no runtime deps, easy to test |
+| 3 | `gh/client` | Depends on sc-runtime HTTP + retry |
+| 4 | `db` (schema, migrations) | Depends on sc-runtime connection pool |
+| 5 | `daemon` (poll orchestrator) | Depends on all of the above |
+| 6 | `httpd` (axum/warp) | Depends on daemon for state |
+| 7 | `notify` + `atm` (traits) | Depends on daemon for events; traits for pluggability |
+| 8 | `monitor` (EMA) | Pure, last |
+| 9 | `interceptor` (standalone binary) | Last — same pattern as Python POC |
+
+## 15. Remaining Implementation Tasks
 
 Prioritized. Each task includes obsolescence markers: code that should be
 flagged for removal when replaced.
 
 | # | Task | Effort | Makes Obsolete |
 |:---:|:---|:---:|:---|
-| 1 | Dead code cleanup — `_check_monitor` (~460 lines in `daemon.py`), `CiSlow`/`CiTimeout` event types in `notify.py` | Small | Remove `_check_monitor` and unused event types |
+| 0 | **Per-repo timer model** — replace global `ActivityMode` / `_poll_cycle` with per-repo `_timers` dict + `_recalculate_timer()`. Wire `POST /poll?repo=` to reset specific repo. Update `httpd.py` to accept `?repo=` query param. | Large | Global `ActivityMode`, `_recalculate_mode()`, `_next_interval()`, old `POST /poll` (no-repo) semantics |
+| 1 | **SQLite write safety** — remove `check_same_thread=False`. Open per-thread read connections. Ensure notification thread opens its own connection. | Medium | `check_same_thread=False` hack, shared `self.db` across threads |
 | 2 | Rate limit cost logging — `logger.info("poll cost: %d points", rl.cost)` on first run, tune `LOW_WATER` | Small | — |
-| 3 | PR create → daemon wake — interceptor sends `POST /poll` on `gh pr create`. (Requires task 4; becomes a one-liner once HTTP RPC is the CLI path.) | Small | — |
-| 4 | CLI commands use HTTP — `ci status` → `GET /prs`, `ci log` → `GET /prs/:repo/:num`. Daemon owns data; CLI is thin client. | Medium | Deprecate direct SQLite reads from CLI |
-| 5 | `CiSlow`/`CiTimeout` wired to interceptor — move detection from daemon poll to `gh pr view`/`gh pr checks` interceptor path | Medium | Remove daemon-side slow/timeout detection |
+| 3 | Dead code cleanup — remove global mode `_recalculate_mode()`, `_next_interval()`, `ActivityMode` enum, `_poll_lock` | Small | Global mode infrastructure (post task 0 verification) |
+| 4 | CLI commands use HTTP — `ci status` → `GET /prs`, `ci log` → `GET /prs/:repo/:num`. Daemon owns data; CLI is thin client. | Medium | Direct SQLite reads from CLI |
+| 5 | `CiSlow`/`CiTimeout` wired to interceptor — move detection from daemon poll to `gh pr view`/`gh pr checks` interceptor path | Medium | Daemon-side slow/timeout detection |
 | 6 | Integration test — end-to-end: interceptor captures identity → daemon detects conflict → ATM notification fires | Medium | — |
+| 7 | Per-repo timer persistence / startup recovery — on restart, all repos default to 30s, then recalculate | Small | Startup race window (already minimal) |
 
 ### Obsolescence Convention
 
 When code is replaced by a new implementation:
-1. Add `# OBSOLETE: replaced by <mechanism> — remove after <task #> verified` above the old code.
+1. Add `# OBSOLETE: replaced by <mechanism> — remove after task <#> verified` above the old code.
 2. Do NOT delete the old code in the same commit that adds its replacement — let tests validate the new path first.
 3. Once the new path is verified (tests pass, CI green), remove the old code in a dedicated cleanup commit.
 4. Update this section: move the completed task to a "Done" table and drop its obsolescence marker.

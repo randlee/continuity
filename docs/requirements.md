@@ -116,17 +116,22 @@ def diff_jobs(incoming: list[JobState], current: dict[str, CiEvent]) -> list[CiE
 def diff_prs(incoming: list[PrSnapshot], current: dict[int, PrState]) -> PrDiff: ...
 ```
 
-### 4.3 Module: `daemon` — Poll Loop + Lifecycle
+### 4.3 Module: `daemon` — Per-Repo Poll Orchestrator
 
-Orchestrates polling. Manages lifecycle, mode transitions, signal handlers.
-Depends on `gh/client`, `diff`, `db`. Testable with mocked `GhClient`.
+Orchestrates per-repo polling. Manages lifecycle, timer state, HTTP RPC
+wake handling. Depends on `gh/client`, `diff`, `db`. Testable with mocked
+`GhClient`.
 
 | ID | Requirement |
 |---|---|
-| FR-31 | PR_CHANGED (30s), ACTIVE (5 min), INACTIVE (20 min) adaptive modes |
-| FR-32 | Mode re-evaluated after each poll cycle |
+| FR-31 | Each `owner/repo` tracks its own `next_poll_at` timestamp, independently recalculated after poll |
+| FR-31a | Timer states: PR_CHANGED (30s, when any PR has mergeable=UNKNOWN), ACTIVE (5 min, when any CI job QUEUED or IN_PROGRESS), INACTIVE (20 min, otherwise). Shortest applicable interval wins |
+| FR-31b | Poll loop sleeps for `min(repo_timers) - now`. Only repos whose timers have expired are polled |
+| FR-31c | `POST /poll?repo=owner/repo` resets that repo's timer to `now` (immediate poll). `POST /poll` with no repo polls all repos |
+| FR-31d | Account batching: multiple due repos under the same account are batched into a single GraphQL query |
+| FR-32 | Timer recalculated after each repo poll based on that repo's current state |
 | FR-33 | `ci register` adds repo + installs post-push hook |
-| FR-36 | If rate limit remaining < LOW_WATER (1,000), double the current mode's interval regardless of mode. Restore to default when remaining recovers |
+| FR-36 | Rate limit backoff per account: when `remaining < LOW_WATER`, all repos under that account double their timer interval regardless of individual state |
 
 **Singleton guarantees** (see Architecture §11):
 - PID file at `$CONTINUITY_HOME/daemon.pid`
@@ -162,34 +167,35 @@ HTTP RPC is live. Remove after task 4 verification.
 | FR-47 | Port discovered from `$CONTINUITY_HOME/daemon.port` (written at daemon startup) |
 | FR-48 | Hook is fire-and-forget — backgrounded, does not block git push |
 
-### 4.6 Module: `poll` — Adaptive Interval Calculator
+### 4.6 Module: `timer` — Per-Repo Timer Calculator
 
 Pure function. No I/O.
 
 | ID | Requirement |
 |---|---|
-| FR-31 | `next_interval(mode, rate_limit_remaining)` → seconds |
-| FR-31b | PR_CHANGED = 30s, ACTIVE = 5 min (300s), INACTIVE = 20 min (1200s) |
-| FR-36 | Rate limit backoff: when remaining < LOW_WATER (1,000), double the current mode's interval. Restore to mode default when remaining recovers above threshold |
+| FR-31 | `calc_next_poll(state, rate_limit_remaining) → seconds` |
+| FR-31a | Returns 30s (PR_CHANGED / UNKNOWN mergeable), 300s (ACTIVE / CI running), 1200s (INACTIVE) |
+| FR-36 | Rate limit backoff: when `remaining < LOW_WATER` (1,000), interval × 2; when `remaining < LOW_WATER / 2`, interval × 4. Restore to state-determined interval when remaining recovers |
 
-### Non-Functional
+### 4.7 Module: `interceptor` — Per-Repo Daemon Wake
 
 | ID | Requirement |
 |---|---|
-| NF-11 | Daemon is the only component that talks to GitHub and the only component that writes to SQLite. CLI reads via HTTP RPC exclusively |
-| NF-12 | `ci_events` is append-only. No UPDATE or DELETE on that table |
-| NF-13 | Bearer tokens never written to disk by continuity |
+| FR-50 | Interceptor calls `POST /poll?repo=owner/repo` on daemon HTTP RPC after logging `gh pr create` |
+| FR-51 | Wake is fire-and-forget — interceptor does not block on daemon response |
+| FR-52 | Wake uses the canonical `POST /poll?repo=` endpoint. No platform-specific signal code in the interceptor |
+| FR-53 | Wake is per-repo: only the new PR's repo timer is reset. Other repos are unaffected |
+
+### 4.8 Module: `db` — SQLite Write Safety
+
+| ID | Requirement |
+|---|---|
+| FR-54 | Only the daemon's poll thread writes to SQLite. All other components (HTTPD, notify, interceptor) open their own read connections |
+| FR-55 | No `check_same_thread=False` anywhere. Each thread owns its connection |
+| FR-56 | Daemon commits (`.commit()`) before dispatching notifications. Notification thread always sees committed state |
 | NF-14 | No subprocesses in the hot path (poll loop). Only `gh auth token` at startup |
 | NF-15 | Trigger callbacks fire in spawned tasks. Main poll loop is never blocked by a trigger |
-| NF-16 | SQLite in WAL mode. Daemon writes; CLI reads concurrently without blocking |
-
-### 4.7 Module: `interceptor` — Daemon Wake on PR Create
-
-| ID | Requirement |
-|---|---|
-| FR-50 | Interceptor calls `POST /poll` on daemon HTTP RPC after logging `gh pr create` |
-| FR-51 | Wake is fire-and-forget — interceptor does not block on daemon response |
-| FR-52 | Wake uses the canonical `POST /poll` endpoint. No platform-specific signal code in the interceptor |
+| NF-16 | SQLite in WAL mode. Daemon writes; readers use own connections |
 
 ## 5. Phase 5 — Resilience (Slow/Timeout Detection + EMA)
 
@@ -201,19 +207,19 @@ Pure function. No I/O.
 
 | ID | Requirement |
 |---|---|
-| FR-53 | `avg_ci_duration` updated as EMA (α=0.2) on `conclusion = SUCCESS` only, by daemon poll |
-| FR-54 | Minimum 3 successful runs before thresholds apply |
-| FR-55 | EMA persisted in `repos.avg_ci_duration` column |
+| FR-57 | `avg_ci_duration` updated as EMA (α=0.2) on `conclusion = SUCCESS` only, by daemon poll |
+| FR-58 | Minimum 3 successful runs before thresholds apply |
+| FR-59 | EMA persisted in `repos.avg_ci_duration` column |
 
 ### 5.2 INTERCEPTOR: Slow/Timeout Detection (Sprint 5)
 
 | ID | Requirement |
 |---|---|
-| FR-56 | `CiSlow` trigger fires when elapsed > 2× avg_ci_duration (non-fatal, CI continues) — detected by interceptor on `gh pr view`/`gh pr checks` |
-| FR-57 | `CiTimeout` trigger fires when elapsed > max_ci_duration (or 2× avg if NULL) — detected by interceptor |
-| FR-58 | Slow/timeout triggers fire at most once per CI run |
-| FR-59 | Interceptor reads `avg_ci_duration` and `max_ci_duration` from `repos` table |
-| FR-60 | Interceptor captures `ATM_IDENTITY` for notification routing
+| FR-60 | `CiSlow` trigger fires when elapsed > 2× avg_ci_duration (non-fatal, CI continues) — detected by interceptor on `gh pr view`/`gh pr checks` |
+| FR-61 | `CiTimeout` trigger fires when elapsed > max_ci_duration (or 2× avg if NULL) — detected by interceptor |
+| FR-62 | Slow/timeout triggers fire at most once per CI run |
+| FR-63 | Interceptor reads `avg_ci_duration` and `max_ci_duration` from `repos` table |
+| FR-64 | Interceptor captures `ATM_IDENTITY` for notification routing
 
 ## 6. Phase 6 — Extension Points (ATM / sc-mux)
 
@@ -221,8 +227,8 @@ Pure function. No I/O.
 
 | ID | Requirement |
 |---|---|
-| FR-61 | Trigger events emitted as structured log entries with action, level, and typed fields |
-| FR-62 | Extension consumers have no dependency on continuity internals |
+| FR-65 | Trigger events emitted as structured log entries with action, level, and typed fields |
+| FR-66 | Extension consumers have no dependency on continuity internals |
 
 ### 6.2 ATM Notifications — see [requirements-atm.md](requirements-atm.md)
 
@@ -248,7 +254,7 @@ Key design points:
 
 | ID | Requirement |
 |---|---|
-| FR-63 | sc-mux dashboard reads continuity SQLite for CI status per registered repo/session |
+| FR-67 | sc-mux dashboard reads continuity SQLite for CI status per registered repo/session |
 
 ### Non-Functional
 
@@ -259,17 +265,19 @@ Key design points:
 
 ## 8. Active Implementation Tasks
 
-Prioritized from architecture §14. Obsolescence convention: old code is
+Prioritized from architecture §15. Obsolescence convention: old code is
 marked `# OBSOLETE` but NOT deleted until new path is verified.
 
 | # | Task | Effort | Depends On | Makes Obsolete |
 |:---:|:---|:---:|:---:|:---|
-| 1 | Dead code cleanup | Small | — | `_check_monitor`, unused event types in `notify.py` |
+| 0 | Per-repo timer model — replace global `ActivityMode` with per-repo `_timers` | Large | — | Global `ActivityMode`, `_recalculate_mode()`, `_next_interval()`, `_poll_lock` |
+| 1 | SQLite write safety — per-thread connections, remove `check_same_thread=False` | Medium | — | `check_same_thread=False` hack, shared `self.db` |
 | 2 | Rate limit cost logging + tune `LOW_WATER` | Small | — | — |
-| 3 | PR create → `POST /poll` in interceptor | Small | 4 | — |
+| 3 | Dead code cleanup — remove global mode infrastructure | Small | 0 | Global mode code (post task 0 verification) |
 | 4 | CLI commands use HTTP RPC | Medium | — | Direct SQLite reads from CLI |
 | 5 | `CiSlow`/`CiTimeout` in interceptor parse path | Medium | — | Daemon-side slow/timeout detection |
-| 6 | End-to-end integration test | Medium | 3, 4, 5 | — |
+| 6 | End-to-end integration test | Medium | 0, 4, 5 | — |
+| 7 | Timer startup recovery | Small | — | Startup race window |
 
 ### Obsolescence Convention
 

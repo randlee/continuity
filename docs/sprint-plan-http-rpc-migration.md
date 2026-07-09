@@ -1,5 +1,12 @@
 # Continuity Sprint Plan — HTTP RPC Migration + Cleanup
 
+**Status: SUPERSEDED by `sprint-plan-per-repo-timers.md`**
+
+The architecture has shifted from global polling modes to per-repo timers.
+This plan's tasks 1 (SIGUSR1 removal), 2 (port file), 3 (wake-on-create),
+and 4 (HTTP RPC) are already implemented in the develop branch. The
+remaining structural work is the per-repo timer model (new plan).
+
 **Date**: 2026-07-06
 **Architecture refs**: `docs/architecture.md` §§6, 9.3, 12, 14; `docs/requirements.md` §§4.4–4.7, 8
 
